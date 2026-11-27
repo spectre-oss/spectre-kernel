@@ -1205,6 +1205,16 @@ static int qcom_pas_probe(struct platform_device *pdev)
 	if (ret)
 		goto remove_ssr_sysmon;
 
+	/* Beryllium's sensor PD needs its userspace FastRPC file listener.
+	 * Do not start its watchdog before stage 2 can provide that listener,
+	 * or automatically restart after losing reserved-memory ownership.
+	 */
+	if (of_machine_is_compatible("xiaomi,beryllium") &&
+	    of_device_is_compatible(pdev->dev.of_node, "qcom,sdm845-slpi-pas")) {
+		rproc->auto_boot = false;
+		rproc->recovery_disabled = true;
+	}
+
 	ret = rproc_add(rproc);
 	if (ret)
 		goto remove_setup_tmd;
