@@ -141,6 +141,26 @@ config QCOM_RMTFS_MEM
 
 	  Say y here if you intend to boot the modem remoteproc.
 
+config SUNFISH_DIAG
+	tristate "Pixel 4a DIAG rpmsg sniffer (Lead 3l Stage A)"
+	depends on RPMSG
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  Binds MPSS DIAG_CTRL / DIAG_DATA / DIAG_CMD and dumps RX to
+	  debugfs sunfish_diag/. Pixel 4a (sunfish) bring-up only. No
+	  diagchar. Build as a module.
+
+config SUNFISH_MEMSHARE
+	tristate "Pixel 4a memshare QMI server (Lead 3l Stage B)"
+	depends on QCOM_QMI_HELPERS
+	depends on QCOM_SCM
+	depends on HAS_DMA
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  QMI service 0x34 v1 instance 1. DIAG client 1 / MPSS proc 0
+	  gets 5 MiB CMA assigned HLOS to MSS_MSA only. Pixel 4a
+	  (sunfish) bring-up only. Build as a module.
+
 config QCOM_RPM_MASTER_STATS
 	tristate "Qualcomm RPM Master stats"
 	help

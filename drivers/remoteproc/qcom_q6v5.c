@@ -11,6 +11,7 @@
 #include <linux/interconnect.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/string.h>
 #include <linux/soc/qcom/qcom_aoss.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
@@ -20,6 +21,19 @@
 
 #define Q6V5_LOAD_STATE_MSG_LEN	64
 #define Q6V5_PANIC_DELAY_MS	200
+
+static bool q6v5_adsp_chre_sar_msg(struct qcom_q6v5 *q6v5, const char *msg,
+				   size_t len)
+{
+	if (!q6v5->rproc || !q6v5->rproc->name ||
+	    strcmp(q6v5->rproc->name, "adsp"))
+		return false;
+	if (IS_ERR_OR_NULL(msg) || len == 0 || !msg[0])
+		return false;
+	/* Only CHRE SAR. Do not ignore SNS_SEE_I_0 / other sensor_process. */
+	return strnstr(msg, "sar.cc", len) ||
+	       strnstr(msg, "chre_utils", len);
+}
 
 static int q6v5_load_state_toggle(struct qcom_q6v5 *q6v5, bool enable)
 {
@@ -96,6 +110,7 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
 	reinit_completion(&q6v5->stop_done);
 
 	q6v5->running = true;
+	q6v5->fw_unresponsive = false;
 	q6v5->handover_issued = false;
 
 	q6v5_handover_irq_enable(q6v5);
@@ -141,6 +156,15 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 	else
 		dev_err(q6v5->dev, "watchdog without message\n");
 
+	if (q6v5_adsp_chre_sar_msg(q6v5, IS_ERR(msg) ? NULL : msg, len)) {
+		dev_warn(q6v5->dev,
+			 "ignoring ADSP CHRE/SAR watchdog, leaving rproc+glink up\n");
+		q6v5->fw_unresponsive = true;
+		qcom_sysmon_mark_unresponsive(q6v5->sysmon);
+		/* Keep glink: aborting it made SNS QRTR I/O error while rproc said running. */
+		return IRQ_HANDLED;
+	}
+
 	q6v5->running = false;
 	rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
 
@@ -161,6 +185,19 @@ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 		dev_err(q6v5->dev, "fatal error received: %s\n", msg);
 	else
 		dev_err(q6v5->dev, "fatal error without message\n");
+
+	/*
+	 * Pixel 4a: Google adsp.mbn CHRE SAR fatals sensor_process.
+	 * Restarting the whole ADSP kills audio_pd. Leave rproc up.
+	 */
+	if (q6v5_adsp_chre_sar_msg(q6v5, IS_ERR(msg) ? NULL : msg, len)) {
+		dev_warn(q6v5->dev,
+			 "ignoring ADSP CHRE/SAR fatal, leaving rproc+glink up\n");
+		q6v5->fw_unresponsive = true;
+		qcom_sysmon_mark_unresponsive(q6v5->sysmon);
+		/* Keep glink: aborting it made SNS QRTR I/O error while rproc said running. */
+		return IRQ_HANDLED;
+	}
 
 	q6v5->running = false;
 	rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
@@ -199,6 +236,12 @@ static irqreturn_t q6v5_handover_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
 
+	if (q6v5->handover_issued) {
+		/* Sunfish ADSP retriggers SMP2P handover ~1 Hz; not an error. */
+		dev_dbg(q6v5->dev, "Handover signaled, but it already happened\n");
+		return IRQ_HANDLED;
+	}
+
 	q6v5->handover_issued = true;
 
 	q6v5_handover_irq_disable(q6v5, false);
@@ -234,6 +277,10 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
 
 	q6v5->running = false;
 
+	/* Firmware already dead, or reboot: do not wait on SMP2P/glink. */
+	if (q6v5->fw_unresponsive || qcom_rproc_system_going_down())
+		return 0;
+
 	/* A watchdog/fatal IRQ clears running; logical crashes still need a stop. */
 	if (!was_running || qcom_sysmon_shutdown_acked(sysmon))
 		return 0;
@@ -241,7 +288,7 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
 	qcom_smem_state_update_bits(q6v5->state,
 				    BIT(q6v5->stop_bit), BIT(q6v5->stop_bit));
 
-	ret = wait_for_completion_timeout(&q6v5->stop_done, 5 * HZ);
+	ret = wait_for_completion_timeout(&q6v5->stop_done, HZ);
 
 	qcom_smem_state_update_bits(q6v5->state, BIT(q6v5->stop_bit), 0);
 

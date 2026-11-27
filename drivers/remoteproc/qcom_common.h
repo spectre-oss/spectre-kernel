@@ -2,6 +2,7 @@
 #ifndef __RPROC_QCOM_COMMON_H__
 #define __RPROC_QCOM_COMMON_H__
 
+#include <linux/kernel.h>
 #include <linux/remoteproc.h>
 #include "remoteproc_internal.h"
 #include <linux/soc/qcom/qmi.h>
@@ -49,6 +50,14 @@ void qcom_minidump(struct rproc *rproc, unsigned int minidump_id,
 void qcom_add_glink_subdev(struct rproc *rproc, struct qcom_rproc_glink *glink,
 			   const char *ssr_name);
 void qcom_remove_glink_subdev(struct rproc *rproc, struct qcom_rproc_glink *glink);
+void qcom_abort_glink_subdev(struct qcom_rproc_glink *glink);
+
+static inline bool qcom_rproc_system_going_down(void)
+{
+	return system_state == SYSTEM_RESTART ||
+	       system_state == SYSTEM_HALT ||
+	       system_state == SYSTEM_POWER_OFF;
+}
 
 int qcom_register_dump_segments(struct rproc *rproc, const struct firmware *fw);
 
@@ -69,6 +78,7 @@ struct qcom_sysmon *qcom_add_sysmon_subdev(struct rproc *rproc,
 void qcom_remove_sysmon_subdev(struct qcom_sysmon *sysmon);
 bool qcom_sysmon_shutdown_acked(struct qcom_sysmon *sysmon);
 bool qcom_sysmon_shutdown_irq_state(struct qcom_sysmon *sysmon);
+void qcom_sysmon_mark_unresponsive(struct qcom_sysmon *sysmon);
 #else
 static inline struct qcom_sysmon *qcom_add_sysmon_subdev(struct rproc *rproc,
 							 const char *name,
@@ -89,6 +99,10 @@ static inline bool qcom_sysmon_shutdown_acked(struct qcom_sysmon *sysmon)
 static inline bool qcom_sysmon_shutdown_irq_state(struct qcom_sysmon *sysmon)
 {
 	return false;
+}
+
+static inline void qcom_sysmon_mark_unresponsive(struct qcom_sysmon *sysmon)
+{
 }
 #endif
 

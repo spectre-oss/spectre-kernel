@@ -226,9 +226,18 @@ static void glink_subdev_stop(struct rproc_subdev *subdev, bool crashed)
 {
 	struct qcom_rproc_glink *glink = to_glink_subdev(subdev);
 
+	if (!glink->edge)
+		return;
 	qcom_glink_smem_unregister(glink->edge);
 	glink->edge = NULL;
 }
+
+void qcom_abort_glink_subdev(struct qcom_rproc_glink *glink)
+{
+	if (glink && glink->edge)
+		qcom_glink_smem_abort(glink->edge);
+}
+EXPORT_SYMBOL_GPL(qcom_abort_glink_subdev);
 
 static void glink_subdev_unprepare(struct rproc_subdev *subdev)
 {

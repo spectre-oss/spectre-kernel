@@ -41,6 +41,13 @@ struct qcom_q6v5 {
 	int crash_reason;
 
 	bool running;
+	/*
+	 * ADSP CHRE/SAR fatal was ignored: rproc stays RUNNING and glink
+	 * is left up (SNS). Skip QMI/SMP2P graceful stop so reboot does not hang.
+	 */
+	bool fw_unresponsive;
+	struct qcom_sysmon *sysmon;
+	void (*notify_unresponsive)(struct qcom_q6v5 *q6v5);
 
 	const char *load_state;
 	void (*handover)(struct qcom_q6v5 *q6v5);

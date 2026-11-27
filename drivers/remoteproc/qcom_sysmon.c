@@ -45,6 +45,7 @@ struct qcom_sysmon {
 
 	bool ssr_ack;
 	bool shutdown_acked;
+	bool unresponsive;
 
 	struct qmi_handle qmi;
 	struct sockaddr_qrtr ssctl;
@@ -99,8 +100,7 @@ static void sysmon_send_event(struct qcom_sysmon *sysmon,
 		goto out_unlock;
 	}
 
-	ret = wait_for_completion_timeout(&sysmon->comp,
-					  msecs_to_jiffies(5000));
+	ret = wait_for_completion_timeout(&sysmon->comp, HZ);
 	if (!ret) {
 		dev_err(sysmon->dev, "timeout waiting for sysmon ack\n");
 		goto out_unlock;
@@ -135,8 +135,7 @@ static bool sysmon_request_shutdown(struct qcom_sysmon *sysmon)
 		goto out_unlock;
 	}
 
-	ret = wait_for_completion_timeout(&sysmon->comp,
-					  msecs_to_jiffies(5000));
+	ret = wait_for_completion_timeout(&sysmon->comp, HZ);
 	if (!ret) {
 		dev_err(sysmon->dev, "timeout waiting for sysmon ack\n");
 		goto out_unlock;
@@ -309,7 +308,7 @@ static bool ssctl_request_shutdown_wait(struct qcom_sysmon *sysmon)
 {
 	int ret;
 
-	ret = wait_for_completion_timeout(&sysmon->shutdown_comp, 10 * HZ);
+	ret = wait_for_completion_timeout(&sysmon->shutdown_comp, HZ);
 	if (ret)
 		return true;
 
@@ -350,7 +349,7 @@ static bool ssctl_request_shutdown(struct qcom_sysmon *sysmon)
 		return false;
 	}
 
-	ret = qmi_txn_wait(&txn, 5 * HZ);
+	ret = qmi_txn_wait(&txn, HZ);
 	if (ret < 0) {
 		dev_err(sysmon->dev, "timeout waiting for shutdown response\n");
 	} else if (resp.resp.result) {
@@ -402,7 +401,7 @@ static void ssctl_send_event(struct qcom_sysmon *sysmon,
 		return;
 	}
 
-	ret = qmi_txn_wait(&txn, 5 * HZ);
+	ret = qmi_txn_wait(&txn, HZ);
 	if (ret < 0)
 		dev_err(sysmon->dev, "timeout waiting for subsystem event response\n");
 	else if (resp.resp.result)
@@ -477,6 +476,7 @@ static int sysmon_prepare(struct rproc_subdev *subdev)
 	};
 
 	mutex_lock(&sysmon->state_lock);
+	sysmon->unresponsive = false;
 	sysmon->state = SSCTL_SSR_EVENT_BEFORE_POWERUP;
 	blocking_notifier_call_chain(&sysmon_notifiers, 0, (void *)&event);
 	mutex_unlock(&sysmon->state_lock);
@@ -550,6 +550,13 @@ static void sysmon_stop(struct rproc_subdev *subdev, bool crashed)
 	if (crashed)
 		return;
 
+	/* Dead ADSP (SAR ignore) or reboot: QMI/glink wait hangs PSCI reset. */
+	if (sysmon->unresponsive || qcom_rproc_system_going_down()) {
+		dev_warn(sysmon->dev,
+			 "skipping graceful shutdown; firmware unresponsive or system going down\n");
+		return;
+	}
+
 	if (sysmon->ssctl_instance) {
 		if (!wait_for_completion_timeout(&sysmon->ssctl_comp, HZ / 2))
 			dev_err(sysmon->dev, "timeout waiting for ssctl service\n");
@@ -590,7 +597,8 @@ static int sysmon_notify(struct notifier_block *nb, unsigned long event,
 
 	/* Skip non-running rprocs and the originating instance */
 	if (sysmon->state != SSCTL_SSR_EVENT_AFTER_POWERUP ||
-	    !strcmp(sysmon_event->subsys_name, sysmon->name)) {
+	    !strcmp(sysmon_event->subsys_name, sysmon->name) ||
+	    sysmon->unresponsive || qcom_rproc_system_going_down()) {
 		dev_dbg(sysmon->dev, "not notifying %s\n", sysmon->name);
 		return NOTIFY_DONE;
 	}
@@ -752,6 +760,21 @@ bool qcom_sysmon_shutdown_irq_state(struct qcom_sysmon *sysmon)
 	return shutdown_state;
 }
 EXPORT_SYMBOL_GPL(qcom_sysmon_shutdown_irq_state);
+
+/**
+ * qcom_sysmon_mark_unresponsive() - firmware is dead but rproc still RUNNING
+ * @sysmon:	sysmon context
+ *
+ * Skip QMI/rpmsg graceful shutdown and SSR notify. Pixel 4a ADSP CHRE/SAR
+ * ignore leaves remoteproc running while glink is dead; reboot otherwise hangs
+ * in qmi_send_request / glink intent wait.
+ */
+void qcom_sysmon_mark_unresponsive(struct qcom_sysmon *sysmon)
+{
+	if (sysmon)
+		sysmon->unresponsive = true;
+}
+EXPORT_SYMBOL_GPL(qcom_sysmon_mark_unresponsive);
 
 /**
  * sysmon_probe() - probe sys_mon channel

@@ -15,6 +15,8 @@
 #include <linux/iommu.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
@@ -30,6 +32,7 @@
 #include <linux/soc/qcom/qmi_tmd.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/smem_state.h>
+#include <linux/soc/qcom/socinfo.h>
 #include <dt-bindings/power/qcom,rpmhpd.h>
 #include <dt-bindings/thermal/qcom,pas.h>
 
@@ -94,14 +97,19 @@ struct qcom_pas {
 
 	struct clk *xo;
 	struct clk *aggre2_clk;
+	struct clk *rfclk[12];
+	unsigned int n_rfclk;
 
 	struct regulator *cx_supply;
 	struct regulator *px_supply;
+
+	bool google_modem_smem;
 
 	struct device *proxy_pds[3];
 	const unsigned int *proxy_pd_performance_states;
 
 	int proxy_pd_count;
+	bool proxy_votes_retained;
 
 	const char *dtb_firmware_name;
 	int pas_id;
@@ -141,6 +149,7 @@ struct qcom_pas {
 	struct qcom_rproc_ssr ssr_subdev;
 	struct qcom_sysmon *sysmon;
 	struct platform_device *bam_dmux;
+	struct notifier_block reboot_nb;
 
 	struct qcom_pas_context *pas_ctx;
 	struct qcom_pas_context *dtb_pas_ctx;
@@ -305,10 +314,85 @@ static int qcom_pas_map_carveout(struct rproc *rproc, phys_addr_t mem_phys, size
 	return ret;
 }
 
+/*
+ * Google Pixel (sunfish) modem firmware reads its RF SKU from SMEM item
+ * SMEM_ID_VENDOR0, filled on stock Android by drivers/soc/qcom/modemsmem.
+ * Without it the modem never brings up QLink/RFC: band capabilities stay
+ * empty and DMS SET online returns QMI 52. Layout and values are the stock
+ * modem_smem_type; major/minor/platform/subtype come from the three Google
+ * words XBL appends to socinfo after nmodem_supported (cdt_hwid 0x050E2802
+ * on this unit).
+ */
+#define GOOGLE_SMEM_ID_VENDOR0		134
+#define GOOGLE_SOCINFO_GPLAT_OFFSET	(offsetof(struct socinfo, nmodem_supported) + 4)
+#define GOOGLE_SOCINFO_GPLAT_MIN_SIZE	(GOOGLE_SOCINFO_GPLAT_OFFSET + 3 * sizeof(__le32))
+
+struct google_modem_smem {
+	__le32 version;
+	__le32 reserved_1;
+	__le32 major_id;
+	__le32 minor_id;
+	__le32 subtype;
+	__le32 platform;
+	__le32 reserved_2;
+	__le32 ftm_magic;
+	__le32 efs_magic;
+	__le32 modem_flag;
+	__le32 dsds_magic;
+	__le32 reserved_3[5];
+};
+
+static void qcom_pas_google_modem_smem(struct qcom_pas *pas)
+{
+	struct google_modem_smem v = { };
+	u32 g_plat = 0, g_ver = 0, g_sub = 0;
+	const __le32 *g;
+	const u8 *si;
+	void *dst;
+	size_t sz = 0;
+	int ret;
+
+	si = qcom_smem_get(QCOM_SMEM_HOST_ANY, SMEM_HW_SW_BUILD_ID, &sz);
+	if (!IS_ERR(si) && sz >= GOOGLE_SOCINFO_GPLAT_MIN_SIZE) {
+		g = (const __le32 *)(si + GOOGLE_SOCINFO_GPLAT_OFFSET);
+		g_plat = le32_to_cpu(g[0]);
+		g_ver = le32_to_cpu(g[1]);
+		g_sub = le32_to_cpu(g[2]);
+	}
+	if (!g_plat || !g_ver) {
+		dev_warn(pas->dev, "google modem smem: no g_hw_plat in socinfo, skipping\n");
+		return;
+	}
+
+	ret = qcom_smem_alloc(QCOM_SMEM_HOST_ANY, GOOGLE_SMEM_ID_VENDOR0, sizeof(v));
+	if (ret && ret != -EEXIST) {
+		dev_warn(pas->dev, "google modem smem: alloc failed %d\n", ret);
+		return;
+	}
+	dst = qcom_smem_get(QCOM_SMEM_HOST_ANY, GOOGLE_SMEM_ID_VENDOR0, &sz);
+	if (IS_ERR(dst) || sz < sizeof(v)) {
+		dev_warn(pas->dev, "google modem smem: item %u unusable\n",
+			 GOOGLE_SMEM_ID_VENDOR0);
+		return;
+	}
+
+	v.major_id = cpu_to_le32((g_ver >> 16) & 0xff);
+	v.minor_id = cpu_to_le32(g_ver & 0xff);
+	v.platform = cpu_to_le32(g_plat);
+	v.subtype = cpu_to_le32(g_sub);
+	memcpy(dst, &v, sizeof(v));
+	wmb();
+	dev_info(pas->dev, "google modem smem: platform %u major 0x%x minor 0x%x subtype %u\n",
+		 g_plat, (g_ver >> 16) & 0xff, g_ver & 0xff, g_sub);
+}
+
 static int qcom_pas_start(struct rproc *rproc)
 {
 	struct qcom_pas *pas = rproc->priv;
-	int ret;
+	int ret, i;
+
+	if (pas->google_modem_smem)
+		qcom_pas_google_modem_smem(pas);
 
 	ret = qcom_q6v5_prepare(&pas->q6v5);
 	if (ret)
@@ -326,10 +410,16 @@ static int qcom_pas_start(struct rproc *rproc)
 	if (ret)
 		goto disable_xo_clk;
 
+	for (i = 0; i < pas->n_rfclk; i++) {
+		ret = clk_prepare_enable(pas->rfclk[i]);
+		if (ret)
+			goto disable_rfclk;
+	}
+
 	if (pas->cx_supply) {
 		ret = regulator_enable(pas->cx_supply);
 		if (ret)
-			goto disable_aggre2_clk;
+			goto disable_rfclk;
 	}
 
 	if (pas->px_supply) {
@@ -401,6 +491,9 @@ disable_px_supply:
 disable_cx_supply:
 	if (pas->cx_supply)
 		regulator_disable(pas->cx_supply);
+disable_rfclk:
+	while (i--)
+		clk_disable_unprepare(pas->rfclk[i]);
 disable_aggre2_clk:
 	clk_disable_unprepare(pas->aggre2_clk);
 disable_xo_clk:
@@ -412,13 +505,14 @@ disable_irqs:
 
 	/* firmware is used to pass reference from qcom_pas_start(), drop it now */
 	pas->firmware = NULL;
+	pas->proxy_votes_retained = false;
 
 	return ret;
 }
 
-static void qcom_pas_handover(struct qcom_q6v5 *q6v5)
+static void qcom_pas_release_proxy(struct qcom_pas *pas)
 {
-	struct qcom_pas *pas = container_of(q6v5, struct qcom_pas, q6v5);
+	unsigned int i;
 
 	if (pas->px_supply)
 		regulator_disable(pas->px_supply);
@@ -426,7 +520,53 @@ static void qcom_pas_handover(struct qcom_q6v5 *q6v5)
 		regulator_disable(pas->cx_supply);
 	clk_disable_unprepare(pas->aggre2_clk);
 	clk_disable_unprepare(pas->xo);
+	for (i = 0; i < pas->n_rfclk; i++)
+		clk_disable_unprepare(pas->rfclk[i]);
 	qcom_pas_pds_disable(pas, pas->proxy_pds, pas->proxy_pd_count);
+	pas->proxy_votes_retained = false;
+}
+
+static void qcom_pas_handover(struct qcom_q6v5 *q6v5)
+{
+	struct qcom_pas *pas = container_of(q6v5, struct qcom_pas, q6v5);
+
+	/*
+	 * Keep CX/MSS/RF_CLK/aggre2 (QLink clkref) while MPSS is running.
+	 * qcom_q6v5_unprepare() then sees handover_issued and would skip
+	 * this release — one leaked clk enable_cnt per restart, so later
+	 * clk_prepare_enable() cannot reassert CBCR bit 0. Drop once in
+	 * qcom_pas_stop(). ADSP/CDSP still release here.
+	 */
+	if (q6v5->rproc && q6v5->rproc->name &&
+	    !strcmp(q6v5->rproc->name, "modem")) {
+		pas->proxy_votes_retained = true;
+		return;
+	}
+
+	qcom_pas_release_proxy(pas);
+}
+
+static void qcom_pas_abort_comms(struct qcom_pas *pas)
+{
+	pas->q6v5.fw_unresponsive = true;
+	qcom_sysmon_mark_unresponsive(pas->sysmon);
+	qcom_abort_glink_subdev(&pas->glink_subdev);
+}
+
+static void qcom_pas_notify_unresponsive(struct qcom_q6v5 *q6v5)
+{
+	qcom_pas_abort_comms(container_of(q6v5, struct qcom_pas, q6v5));
+}
+
+static int qcom_pas_reboot_notify(struct notifier_block *nb, unsigned long action,
+				  void *data)
+{
+	struct qcom_pas *pas = container_of(nb, struct qcom_pas, reboot_nb);
+
+	if (action != SYS_RESTART && action != SYS_HALT && action != SYS_POWER_OFF)
+		return NOTIFY_DONE;
+	qcom_pas_abort_comms(pas);
+	return NOTIFY_OK;
 }
 
 static int qcom_pas_stop(struct rproc *rproc)
@@ -435,6 +575,11 @@ static int qcom_pas_stop(struct rproc *rproc)
 	int handover;
 	int dtb_ret;
 	int ret;
+
+	if (qcom_rproc_system_going_down()) {
+		pas->q6v5.running = false;
+		return 0;
+	}
 
 	ret = qcom_q6v5_request_stop(&pas->q6v5, pas->sysmon);
 	if (ret == -ETIMEDOUT)
@@ -461,8 +606,8 @@ static int qcom_pas_stop(struct rproc *rproc)
 	qcom_pas_unmap_carveout(rproc, pas->mem_phys, pas->mem_size);
 
 	handover = qcom_q6v5_unprepare(&pas->q6v5);
-	if (handover)
-		qcom_pas_handover(&pas->q6v5);
+	if (pas->proxy_votes_retained || handover)
+		qcom_pas_release_proxy(pas);
 
 	if (pas->smem_host_id)
 		ret = qcom_smem_bust_hwspin_lock_by_host(pas->smem_host_id);
@@ -654,6 +799,26 @@ static int qcom_pas_init_clock(struct qcom_pas *pas)
 	if (IS_ERR(pas->aggre2_clk))
 		return dev_err_probe(pas->dev, PTR_ERR(pas->aggre2_clk),
 				     "failed to get aggre2 clock");
+
+	{
+		static const char * const names[] = {
+			"rfclk1", "rfclk2", "rfclk1_ao", "rfclk2_ao",
+			"iface", "snoc_axi", "mnoc_axi", "nav", "mfab",
+		};
+		unsigned int i;
+
+		pas->n_rfclk = 0;
+		for (i = 0; i < ARRAY_SIZE(names); i++) {
+			struct clk *c = devm_clk_get_optional(pas->dev, names[i]);
+
+			if (IS_ERR(c))
+				return dev_err_probe(pas->dev, PTR_ERR(c),
+						     "failed to get %s clock",
+						     names[i]);
+			if (c)
+				pas->rfclk[pas->n_rfclk++] = c;
+		}
+	}
 
 	return 0;
 }
@@ -946,10 +1111,15 @@ static int qcom_pas_probe(struct platform_device *pdev)
 
 	rproc->has_iommu = of_property_present(pdev->dev.of_node, "iommus");
 	rproc->auto_boot = desc->auto_boot;
+	/* Sunfish: start ADSP after Phosh so CS35 can play in the ~10s pre-SAR window. */
+	if (of_property_read_bool(pdev->dev.of_node, "qcom,manual-boot"))
+		rproc->auto_boot = false;
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 
 	pas = rproc->priv;
 	pas->dev = &pdev->dev;
+	pas->google_modem_smem = of_property_read_bool(pdev->dev.of_node,
+						       "google,modem-smem");
 	pas->rproc = rproc;
 	pas->minidump_id = desc->minidump_id;
 	pas->pas_id = desc->pas_id;
@@ -1007,6 +1177,7 @@ static int qcom_pas_probe(struct platform_device *pdev)
 			     desc->load_state, qcom_pas_handover);
 	if (ret)
 		goto detach_proxy_pds;
+	pas->q6v5.notify_unresponsive = qcom_pas_notify_unresponsive;
 
 	qcom_add_glink_subdev(rproc, &pas->glink_subdev, desc->ssr_name);
 	qcom_add_smd_subdev(rproc, &pas->smd_subdev);
@@ -1016,6 +1187,10 @@ static int qcom_pas_probe(struct platform_device *pdev)
 		ret = PTR_ERR(pas->sysmon);
 		goto deinit_remove_pdm_smd_glink;
 	}
+	pas->q6v5.sysmon = pas->sysmon;
+	pas->reboot_nb.notifier_call = qcom_pas_reboot_notify;
+	pas->reboot_nb.priority = INT_MAX;
+	register_reboot_notifier(&pas->reboot_nb);
 
 	qcom_add_ssr_subdev(rproc, &pas->ssr_subdev, desc->ssr_name);
 
@@ -1045,6 +1220,7 @@ remove_setup_tmd:
 		qmi_tmd_exit(pas->tmd_inst);
 
 remove_ssr_sysmon:
+	unregister_reboot_notifier(&pas->reboot_nb);
 	qcom_remove_ssr_subdev(rproc, &pas->ssr_subdev);
 	qcom_remove_sysmon_subdev(pas->sysmon);
 deinit_remove_pdm_smd_glink:
@@ -1069,6 +1245,7 @@ static void qcom_pas_remove(struct platform_device *pdev)
 	if (pas->bam_dmux)
 		of_platform_device_destroy(&pas->bam_dmux->dev, NULL);
 
+	unregister_reboot_notifier(&pas->reboot_nb);
 	rproc_del(pas->rproc);
 
 	if (pas->tmd_inst)
