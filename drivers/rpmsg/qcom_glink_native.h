@@ -36,6 +36,7 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 					   struct qcom_glink_pipe *tx,
 					   bool intentless);
 void qcom_glink_native_remove(struct qcom_glink *glink);
+void qcom_glink_native_abort(struct qcom_glink *glink);
 void qcom_glink_native_rx(struct qcom_glink *glink);
 
 #endif

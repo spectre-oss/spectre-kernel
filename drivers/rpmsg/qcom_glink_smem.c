@@ -367,6 +367,13 @@ err_put_dev:
 }
 EXPORT_SYMBOL_GPL(qcom_glink_smem_register);
 
+void qcom_glink_smem_abort(struct qcom_glink_smem *smem)
+{
+	if (smem && smem->glink)
+		qcom_glink_native_abort(smem->glink);
+}
+EXPORT_SYMBOL_GPL(qcom_glink_smem_abort);
+
 void qcom_glink_smem_unregister(struct qcom_glink_smem *smem)
 {
 	struct qcom_glink *glink = smem->glink;

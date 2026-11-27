@@ -28,6 +28,8 @@
 
 #define GLINK_NAME_SIZE		32
 #define GLINK_VERSION_1		1
+/* Dead DSP (sunfish ADSP SAR) used to wait 10s per TX and loop forever. */
+#define GLINK_TX_WAIT		(HZ)
 
 #define RPM_GLINK_CID_MIN	1
 #define RPM_GLINK_CID_MAX	65536
@@ -345,6 +347,7 @@ static int qcom_glink_tx(struct qcom_glink *glink,
 {
 	unsigned int tlen = hlen + dlen;
 	unsigned long flags;
+	unsigned long tmo;
 	int ret = 0;
 
 	/* Reject packets that are too big */
@@ -377,10 +380,24 @@ static int qcom_glink_tx(struct qcom_glink *glink,
 		/* Wait without holding the tx_lock */
 		spin_unlock_irqrestore(&glink->tx_lock, flags);
 
-		wait_event_timeout(glink->tx_avail_notify,
-				   qcom_glink_tx_avail(glink) >= tlen, 10 * HZ);
+		tmo = wait_event_timeout(glink->tx_avail_notify,
+					 qcom_glink_tx_avail(glink) >= tlen ||
+					 READ_ONCE(glink->abort_tx),
+					 GLINK_TX_WAIT);
 
 		spin_lock_irqsave(&glink->tx_lock, flags);
+
+		if (glink->abort_tx) {
+			ret = -EIO;
+			goto out;
+		}
+		if (!tmo && qcom_glink_tx_avail(glink) < tlen) {
+			/* Remote is not draining the TX FIFO. */
+			glink->abort_tx = true;
+			wake_up_all(&glink->tx_avail_notify);
+			ret = -ETIMEDOUT;
+			goto out;
+		}
 
 		if (qcom_glink_tx_avail(glink) >= tlen)
 			glink->sent_read_notify = false;
@@ -1005,6 +1022,9 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
 		channel->buf = NULL;
 
 		qcom_glink_rx_done(glink, channel, intent);
+
+		pm_wakeup_ws_event(channel->ept.rpdev->dev.power.wakeup, 0,
+				   true);
 	}
 
 advance_rx:
@@ -1454,10 +1474,11 @@ static int qcom_glink_request_intent(struct qcom_glink *glink,
 				 READ_ONCE(channel->intent_req_result) == 0 ||
 				 (READ_ONCE(channel->intent_req_result) > 0 &&
 				  READ_ONCE(channel->intent_received)) ||
-				 glink->abort_tx,
-				 10 * HZ);
+				 READ_ONCE(glink->abort_tx),
+				 GLINK_TX_WAIT);
 	if (!ret) {
 		dev_err(glink->dev, "intent request timed out\n");
+		qcom_glink_native_abort(glink);
 		ret = -ETIMEDOUT;
 	} else if (glink->abort_tx) {
 		ret = -ECANCELED;
@@ -1688,6 +1709,12 @@ static int qcom_glink_rx_open(struct qcom_glink *glink, unsigned int rcid,
 		ret = rpmsg_register_device(rpdev);
 		if (ret)
 			goto rcid_remove;
+
+		/*
+		 * Declare all channels as wakeup capable, but don't enable
+		 * waking up by default (for incoming calls/SMS on IPCRTR).
+		 */
+		device_set_wakeup_capable(&rpdev->dev, true);
 
 		channel->rpdev = rpdev;
 	}
@@ -1944,26 +1971,44 @@ static int qcom_glink_remove_device(struct device *dev, void *data)
 	return 0;
 }
 
-void qcom_glink_native_remove(struct qcom_glink *glink)
+/**
+ * qcom_glink_native_abort() - fail pending TX immediately (IRQ-safe)
+ * @glink: glink edge
+ *
+ * Used when the remote is dead but rproc is still RUNNING (Pixel 4a ADSP
+ * CHRE/SAR ignore) and on reboot, so device_shutdown does not wait 10s
+ * per intent.
+ */
+void qcom_glink_native_abort(struct qcom_glink *glink)
 {
 	struct glink_channel *channel;
 	unsigned long flags;
 	int cid;
-	int ret;
 
-	qcom_glink_cancel_rx_work(glink);
+	if (!glink)
+		return;
 
-	/* Fail all attempts at sending messages */
 	spin_lock_irqsave(&glink->tx_lock, flags);
 	glink->abort_tx = true;
 	wake_up_all(&glink->tx_avail_notify);
 	spin_unlock_irqrestore(&glink->tx_lock, flags);
 
-	/* Abort any senders waiting for intent requests */
 	spin_lock_irqsave(&glink->idr_lock, flags);
 	idr_for_each_entry(&glink->lcids, channel, cid)
 		qcom_glink_intent_req_abort(channel);
 	spin_unlock_irqrestore(&glink->idr_lock, flags);
+}
+EXPORT_SYMBOL_GPL(qcom_glink_native_abort);
+
+void qcom_glink_native_remove(struct qcom_glink *glink)
+{
+	struct glink_channel *channel;
+	int cid;
+	int ret;
+
+	qcom_glink_cancel_rx_work(glink);
+
+	qcom_glink_native_abort(glink);
 
 	ret = device_for_each_child(glink->dev, NULL, qcom_glink_remove_device);
 	if (ret)

@@ -18,6 +18,7 @@ static inline void qcom_glink_ssr_notify(const char *ssr_name) {}
 struct qcom_glink_smem *qcom_glink_smem_register(struct device *parent,
 						 struct device_node *node);
 void qcom_glink_smem_unregister(struct qcom_glink_smem *glink);
+void qcom_glink_smem_abort(struct qcom_glink_smem *glink);
 
 #else
 
@@ -29,6 +30,7 @@ qcom_glink_smem_register(struct device *parent,
 }
 
 static inline void qcom_glink_smem_unregister(struct qcom_glink_smem *glink) {}
+static inline void qcom_glink_smem_abort(struct qcom_glink_smem *glink) {}
 #endif
 
 #endif
