@@ -230,6 +230,8 @@ struct qca_serdev {
 	u32 oper_speed;
 	bool bdaddr_property_broken;
 	bool support_hfp_hw_offload;
+	/* Combo WCN3990: HCI down must not pulse/drop shared Wi-Fi rails. */
+	bool keep_power;
 	const char *firmware_name[2];
 };
 
@@ -1809,6 +1811,9 @@ static int qca_regulator_init(struct hci_uart *hu)
 	 */
 	qcadev = serdev_device_get_drvdata(hu->serdev);
 
+	if (qcadev->bt_power->vregs_on && qcadev->keep_power)
+		return 0;
+
 	if (!qcadev->bt_power->vregs_on) {
 		qca_port_close(hu);
 		ret = qca_regulator_enable(qcadev);
@@ -2280,6 +2285,11 @@ static void qca_power_off(struct hci_uart *hu)
 	qcadev = serdev_device_get_drvdata(hu->serdev);
 	power = qcadev->bt_power;
 
+	if (qcadev->keep_power) {
+		set_bit(QCA_BT_OFF, &qca->flags);
+		return;
+	}
+
 	switch (soc_type) {
 	case QCA_WCN3988:
 	case QCA_WCN3990:
@@ -2454,6 +2464,8 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 
 	qcadev->bdaddr_property_broken = device_property_read_bool(&serdev->dev,
 			"qcom,local-bd-address-broken");
+	qcadev->keep_power = device_property_read_bool(&serdev->dev,
+			"qcom,keep-power");
 
 	if (data)
 		qcadev->btsoc_type = data->soc_type;
@@ -2590,6 +2602,9 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 	}
 
 	hdev = qcadev->serdev_hu.hdev;
+
+	if (qcadev->keep_power)
+		power_ctrl_enabled = false;
 
 	if (power_ctrl_enabled) {
 		hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);

@@ -36,6 +36,13 @@ properties:
   vddxo-supply:
     description: VDD_XO supply regulator handle
 
+  qcom,keep-power:
+    type: boolean
+    description:
+      Leave the WCN399x powered when HCI goes down. The 2400 baud
+      power-off pulse and vddio drop are shared with Wi-Fi on combo
+      dies and can hard-reset the SoC.
+
 required:
   - compatible
   - vddch0-supply

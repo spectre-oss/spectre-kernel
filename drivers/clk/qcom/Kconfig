@@ -1284,6 +1284,15 @@ config SC_LPASS_CORECC_7180
 	  Say Y if you want to use LPASS clocks and power domains of the LPASS
 	  core clock controller.
 
+config SM_LPASS_CORECC_7150
+	tristate "SM7150 LPASS Core Clock Controller"
+	depends on ARM64 || COMPILE_TEST
+	depends on SM_GCC_7150
+	select QCOM_GDSC
+	help
+	  SC7180-compatible LPASS core CC on SM7150 (0x62d00000 / 0x63000000).
+	  Load after GCC LPASS sway. Do not autoload at splash.
+
 config SC_LPASS_CORECC_7280
 	tristate "SC7280 LPASS Core & Audio Clock Controller"
 	depends on ARM64 || COMPILE_TEST

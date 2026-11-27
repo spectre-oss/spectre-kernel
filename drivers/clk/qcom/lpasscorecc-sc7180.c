@@ -449,17 +449,15 @@ static int lpass_hm_core_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id lpass_hm_sc7180_match_table[] = {
-	{
-		.compatible = "qcom,sc7180-lpasshm",
-	},
+	{ .compatible = "qcom,sc7180-lpasshm" },
+	{ .compatible = "qcom,sm7150-lpasshm" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, lpass_hm_sc7180_match_table);
 
 static const struct of_device_id lpass_core_cc_sc7180_match_table[] = {
-	{
-		.compatible = "qcom,sc7180-lpasscorecc",
-	},
+	{ .compatible = "qcom,sc7180-lpasscorecc" },
+	{ .compatible = "qcom,sm7150-lpasscorecc" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, lpass_core_cc_sc7180_match_table);

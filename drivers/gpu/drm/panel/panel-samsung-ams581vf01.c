@@ -10,6 +10,28 @@
 #include <linux/of.h>
 #include <linux/regulator/consumer.h>
 
+/*
+ * Display-off fuzz knobs (builtin: panel_samsung_ams581vf01.<name>=).
+ * Probe used to get reset as GPIOD_OUT_HIGH, which asserts RESET and
+ * kills U-Boot splash before DRM has DSI. If prepare() then fails, the
+ * OLED stays off while SSH still works.
+ */
+static int skip_reset;
+module_param(skip_reset, int, 0644);
+MODULE_PARM_DESC(skip_reset, "do not pulse RESET in prepare (keep splash)");
+
+static int keep_rails = 1;
+module_param(keep_rails, int, 0644);
+MODULE_PARM_DESC(keep_rails, "on prepare fail, do not hold reset or drop rails");
+
+static int retries = 3;
+module_param(retries, int, 0644);
+MODULE_PARM_DESC(retries, "DCS on() attempts after reset");
+
+static int reset_ms = 20;
+module_param(reset_ms, int, 0644);
+MODULE_PARM_DESC(reset_ms, "reset pulse / settle in ms");
+
 #include <video/mipi_display.h>
 
 #include <drm/drm_mipi_dsi.h>
@@ -42,10 +64,12 @@ static inline struct ams581vf01 *to_ams581vf01(struct drm_panel *panel)
 
 static void ams581vf01_reset(struct ams581vf01 *ctx)
 {
+	unsigned int ms = reset_ms > 0 ? reset_ms : 10;
+
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	usleep_range(10000, 11000);
+	fsleep(ms * 1000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
-	usleep_range(10000, 11000);
+	fsleep(ms * 1000);
 }
 
 static int ams581vf01_on(struct ams581vf01 *ctx)
@@ -110,24 +134,36 @@ static void ams581vf01_off(struct ams581vf01 *ctx)
 static int ams581vf01_prepare(struct drm_panel *panel)
 {
 	struct ams581vf01 *ctx = to_ams581vf01(panel);
-	int ret;
+	int ret, i, n;
 
 	ret = regulator_bulk_enable(ARRAY_SIZE(ams581vf01_supplies),
 				    ctx->supplies);
 	if (ret < 0)
 		return ret;
 
-	ams581vf01_reset(ctx);
+	if (!skip_reset)
+		ams581vf01_reset(ctx);
 
-	ret = ams581vf01_on(ctx);
-	if (ret < 0) {
-		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-		regulator_bulk_disable(ARRAY_SIZE(ams581vf01_supplies),
-				       ctx->supplies);
-		return ret;
+	n = retries > 0 ? retries : 1;
+	for (i = 0; i < n; i++) {
+		ret = ams581vf01_on(ctx);
+		if (ret == 0)
+			return 0;
+		dev_warn(panel->dev, "DCS on failed (%d), try %d/%d\n",
+			 ret, i + 1, n);
+		fsleep((reset_ms > 0 ? reset_ms : 20) * 1000);
 	}
 
-	return 0;
+	if (keep_rails) {
+		dev_warn(panel->dev,
+			 "prepare failed, leaving rails/reset (keep_rails)\n");
+		return 0;
+	}
+
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	regulator_bulk_disable(ARRAY_SIZE(ams581vf01_supplies),
+			       ctx->supplies);
+	return ret;
 }
 
 static int ams581vf01_unprepare(struct drm_panel *panel)
@@ -224,10 +260,12 @@ static int ams581vf01_probe(struct mipi_dsi_device *dsi)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "Failed to get regulators\n");
 
-	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	/* ASIS: do not assert RESET here (that blanks the OLED/splash). */
+	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 					"Failed to get reset-gpios\n");
+	gpiod_direction_output(ctx->reset_gpio, 0);
 
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
