@@ -8,6 +8,9 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6voice.h>
 #include "sdm845.dtsi"
 #include "sdm845-wcd9340.dtsi"
 #include "pm8998.dtsi"
@@ -37,6 +40,7 @@
 	qcom,msm-id = <QCOM_ID_SDM845 0x20001>;
 
 	aliases {
+		serial0 = &uart9;
 		serial1 = &uart6;
 	};
 
@@ -44,6 +48,8 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
+
+		stdout-path = "serial0:115200n8";
 
 		framebuffer {
 			compatible = "simple-framebuffer";
@@ -154,6 +160,52 @@
 		regulator-max-microvolt = <1800000>;
 		regulator-always-on;
 	};
+
+	cam_iovdd: reg_cam_iovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_iovdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		enable-active-high;
+		gpio = <&tlmm 50 GPIO_ACTIVE_HIGH>;
+	};
+
+	cam_ldo: reg_cam_ldo {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_ldo";
+		regulator-min-microvolt = <1350000>;
+		regulator-max-microvolt = <1350000>;
+		enable-active-high;
+		gpio = <&tlmm 99 GPIO_ACTIVE_HIGH>;
+		regulator-always-on;
+	};
+
+	cam0_avdd: reg_cam0_avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0_avdd";
+		enable-active-high;
+		gpio = <&tlmm 40 GPIO_ACTIVE_HIGH>;
+	};
+
+	cam0_dvdd: reg_cam0_dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0_dvdd";
+		regulator-min-microvolt = <1350000>;
+		regulator-max-microvolt = <1350000>;
+		regulator-enable-ramp-delay = <135>;
+		enable-active-high;
+		gpio = <&pm8998_gpios 11 GPIO_ACTIVE_HIGH>;
+	};
+
+	cam0_actuator_regulator: gpio-regulator@5 {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0_actuator_regulator";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		regulator-enable-ramp-delay = <100>;
+		enable-active-high;
+		gpio = <&tlmm 26 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &adsp_pas {
@@ -166,6 +218,9 @@
 		compatible = "qcom,pm8998-rpmh-regulators";
 		qcom,pmic-id = "a";
 
+		vdda_mipi_csi0_0p9:
+		vdda_mipi_csi1_0p9:
+		vdda_mipi_csi2_0p9:
 		vreg_l1a_0p875: ldo1 {
 			regulator-min-microvolt = <880000>;
 			regulator-max-microvolt = <880000>;
@@ -250,10 +305,75 @@
 	};
 };
 
+&cci {
+	status = "okay";
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l1a_0p875>;
+	vdda-pll-supply = <&vreg_l26a_1p2>;
+
+	vdda-csi0-supply = <&vdda_mipi_csi0_0p9>;
+	vdda-csi1-supply = <&vdda_mipi_csi1_0p9>;
+	vdda-csi2-supply = <&vdda_mipi_csi2_0p9>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			csiphy0_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx363_ep>;
+			};
+		};
+	};
+};
+
 &cci_i2c0 {
 	status = "okay";
 
-	/* IMX363 @ 10 */
+	actuator: actuator@c {
+		compatible = "rohm,bu64748";
+		reg = <0x0c>;
+		vcc-supply = <&cam0_actuator_regulator>;
+		vio-supply = <&cam_iovdd>;
+		status = "okay";
+	};
+
+	camera@10 {
+		compatible = "sony,imx363";
+		reg = <0x10>;
+
+		reset-gpios = <&tlmm 80 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam0_default &cam_mclk0_default>;
+
+		clocks = <&clock_camcc CAM_CC_MCLK0_CLK>;
+		clock-names = "xvclk";
+		clock-frequency = <24000000>;
+
+		vif-supply = <&cam_iovdd>;
+		vana-supply = <&cam0_avdd>;
+		vdig-supply = <&cam0_dvdd>;
+
+		orientation = <1>;
+		rotation = <270>;
+
+		status = "okay";
+
+		port {
+			imx363_ep: endpoint {
+				clock-lanes = <1>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <636000000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
 };
 
 &cdsp_pas {
@@ -267,6 +387,10 @@
 			   <GCC_QSPI_CNOC_PERIPH_AHB_CLK>,
 			   <GCC_LPASS_Q6_AXI_CLK>,
 			   <GCC_LPASS_SWAY_CLK>;
+};
+
+&gpi_dma0 {
+	status = "okay";
 };
 
 &gpi_dma1 {
@@ -355,6 +479,26 @@
 	"qcom/sdm845/Xiaomi/beryllium/modem.mbn";
 };
 
+&i2c5 {
+	#dma-cells = <3>;
+	status="okay";
+
+	dmas = <&gpi_dma0 0 5 QCOM_GPI_I2C>,
+		   <&gpi_dma0 1 5 QCOM_GPI_I2C>;
+	dma-names = "tx", "rx";
+
+	/*smart PA*/
+	tas2559_codec: tas2559@4c{
+		#sound-dai-cells = <1>;
+		compatible = "ti,tas2559";
+		reg = <0x4c>;
+		ti,tas2559-reset-gpio = <&tlmm 12 0>;
+		ti,tas2560-reset-gpio = <&tlmm 76 0>;
+		ti,tas2559-addr = <0x4c>;
+		ti,tas2560-addr = <0x4d>;
+	};
+};
+
 &pm8998_gpios {
 	vol_up_pin_a: vol-up-active-state {
 		pins = "gpio6";
@@ -414,6 +558,19 @@
 	};
 };
 
+&pmi8998_fg {
+	power-supplies = <&pmi8998_charger>;
+	monitored-battery = <&battery>;
+
+	status = "okay";
+};
+
+&pmi8998_haptics {
+	qcom,wave-play-rate-us = <4878>;
+
+	status = "okay";
+};
+
 &pm8998_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
@@ -439,6 +596,10 @@
 	dai@2 {
 		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
 	};
+
+	dai@3 {
+		reg = <3>;
+	};
 };
 
 &qupv3_id_0 {
@@ -447,6 +608,16 @@
 
 &qupv3_id_1 {
 	status = "okay";
+};
+
+&qup_uart9_rx {
+	drive-strength = <2>;
+	bias-pull-up;
+};
+
+&qup_uart9_tx {
+	drive-strength = <2>;
+	bias-disable;
 };
 
 &sdhc_2 {
@@ -483,21 +654,50 @@
 	mm1-dai-link {
 		link-name = "MultiMedia1";
 		cpu {
-			sound-dai = <&q6asmdai  MSM_FRONTEND_DAI_MULTIMEDIA1>;
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
 		};
 	};
 
 	mm2-dai-link {
 		link-name = "MultiMedia2";
 		cpu {
-			sound-dai = <&q6asmdai  MSM_FRONTEND_DAI_MULTIMEDIA2>;
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
 		};
 	};
 
 	mm3-dai-link {
 		link-name = "MultiMedia3";
 		cpu {
-			sound-dai = <&q6asmdai  MSM_FRONTEND_DAI_MULTIMEDIA3>;
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
+		};
+	};
+
+	mm4-dai-link {
+		link-name = "MultiMedia4";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA4>;
+		};
+	};
+
+	dai-link-voicemmode1 {
+		link-name = "VoiceMMode1";
+		cpu {
+			sound-dai = <&q6voicedai VOICEMMODE1>;
+		};
+	};
+
+	tas2559-dai-link {
+		link-name = "Primary Spkr Playback";
+		cpu {
+			sound-dai = <&q6afedai QUATERNARY_MI2S_RX>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai =  <&tas2559_codec 0>;
 		};
 	};
 
@@ -517,7 +717,7 @@
 	};
 
 	slimcap-dai-link {
-		link-name = "SLIM Capture";
+		link-name = "SLIM WCD Capture";
 		cpu {
 			sound-dai = <&q6afedai SLIMBUS_0_TX>;
 		};
@@ -527,13 +727,46 @@
 		};
 
 		codec {
-			sound-dai = <&wcd9340 1>;
+			sound-dai = <&wcd9340 1>; /* AIF1_CAP */
+		};
+	};
+
+	slimcap2-dai-link {
+		link-name = "SLIM WCD Capture 2";
+		cpu {
+			sound-dai = <&q6afedai SLIMBUS_1_TX>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&wcd9340 3>; /* AIF2_CAP */
 		};
 	};
 };
 
 &tlmm {
 	gpio-reserved-ranges = <0 4>, <81 4>;
+
+	cam0_default: cam0_default {
+		rst {
+			pins = "gpio80";
+			function = "gpio";
+
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		avdd {
+			pins = "gpio40";
+			function = "gpio";
+
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
 
 	sdc2_default_state: sdc2-default-state {
 		clk-pins {
@@ -607,6 +840,11 @@
 		vddch0-supply = <&vreg_l25a_3p3>;
 		max-speed = <3200000>;
 	};
+};
+
+&uart9 {
+	label = "LS-UART1";
+	status = "okay";
 };
 
 &ufs_mem_hc {
@@ -684,3 +922,21 @@
 	qcom,snoc-host-cap-skip-quirk;
 };
 
+/* qdsp6 hacks */
+&q6cvp {
+	status = "okay";
+};
+
+&q6cvs {
+	status = "okay";
+};
+
+&q6mvm {
+	status = "okay";
+};
+
+&q6voicedai {
+	dai@1 {
+		reg = <VOICEMMODE1>;
+	};
+};
