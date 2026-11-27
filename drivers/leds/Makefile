@@ -128,3 +128,4 @@ obj-y					+= blink/
 
 # Simatic LED drivers
 obj-y					+= simatic/
+obj-$(CONFIG_VIDEO_OV7251) += leds-lm3644-ir.o

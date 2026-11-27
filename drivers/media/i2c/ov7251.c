@@ -15,6 +15,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -232,6 +233,24 @@ static const struct ov7251_pll_cfgs ov7251_pll_cfgs_24_mhz = {
 static const struct ov7251_pll_cfgs *ov7251_pll_cfgs[] = {
 	[OV7251_19_2_MHZ] = &ov7251_pll_cfgs_19_2_mhz,
 	[OV7251_24_MHZ] = &ov7251_pll_cfgs_24_mhz,
+};
+
+/* Beryllium RAM diagnostic: observed stock strobe output configuration.
+ * The separate LM3644 driver keeps its hardware enable low except during a
+ * bounded explicit pulse. This does not itself enable the illuminator.
+ */
+static const struct reg_value ov7251_beryllium_strobe[] = {
+	{ 0x3016, 0x10 },
+	{ 0x3017, 0x00 },
+	{ 0x3018, 0x00 },
+	{ 0x301a, 0x00 },
+	{ 0x301b, 0x00 },
+	{ 0x301c, 0x20 },
+	{ 0x3b81, 0xff },
+	{ 0x3b96, 0xc0 },
+	{ 0x3b8b, 0x00 },
+	{ 0x3b8f, 0x80 },
+	{ 0x3005, 0x08 },
 };
 
 static const struct reg_value ov7251_global_init_setting[] = {
@@ -1363,6 +1382,14 @@ static int ov7251_s_stream(struct v4l2_subdev *subdev, int enable)
 				ov7251->current_mode->width,
 				ov7251->current_mode->height);
 			goto err_power_down;
+		}
+		if (device_property_read_bool(ov7251->dev,
+					      "spectre,enable-ir-strobe")) {
+			ret = ov7251_set_register_array(ov7251,
+					ov7251_beryllium_strobe,
+					ARRAY_SIZE(ov7251_beryllium_strobe));
+			if (ret)
+				goto err_power_down;
 		}
 		ret = __v4l2_ctrl_handler_setup(&ov7251->ctrls);
 		if (ret < 0) {
