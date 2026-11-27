@@ -23,6 +23,8 @@
 
 #define ADM_CMD_DEVICE_OPEN_V5		0x00010326
 #define ADM_CMDRSP_DEVICE_OPEN_V5	0x00010329
+#define ADM_CMD_DEVICE_OPEN_V8		0x0001036A
+#define ADM_CMDRSP_DEVICE_OPEN_V8	0x0001036B
 #define ADM_CMD_DEVICE_CLOSE_V5		0x00010327
 #define ADM_CMD_MATRIX_MAP_ROUTINGS_V5	0x00010325
 
@@ -75,6 +77,24 @@ struct q6adm_cmd_device_open_v5 {
 	u16 bit_width;
 	u32 sample_rate;
 	u8 dev_channel_mapping[8];
+} __packed;
+
+/* 4.14 sunfish: ADM_CMD_DEVICE_OPEN_V8 + endpoint payload. */
+struct q6adm_cmd_device_open_v8 {
+	u16 flags;
+	u16 mode_of_operation;
+	u32 topology_id;
+	u16 endpoint_id_1;
+	u16 endpoint_id_2;
+	u16 endpoint_id_3;
+	u16 reserved;
+} __packed;
+
+struct q6adm_device_endpoint_payload {
+	u16 dev_num_channel;
+	u16 bit_width;
+	u32 sample_rate;
+	u8 dev_channel_mapping[32];
 } __packed;
 
 struct q6adm_cmd_matrix_map_routings_v5 {
@@ -177,7 +197,9 @@ static void q6adm_free_copp(struct kref *ref)
 
 	ret = q6adm_device_close(adm, c, c->afe_port, c->copp_idx);
 	if (ret < 0)
-		dev_err(adm->dev, "Failed to close copp %d\n", ret);
+		dev_warn(adm->dev,
+			 "COPP close failed %d (DSP already gone after ADSP recycle)\n",
+			 ret);
 
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	clear_bit(c->copp_idx, &adm->copp_bitmap[c->afe_port]);
@@ -218,6 +240,7 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		}
 		switch (result->opcode) {
 		case ADM_CMD_DEVICE_OPEN_V5:
+		case ADM_CMD_DEVICE_OPEN_V8:
 		case ADM_CMD_DEVICE_CLOSE_V5:
 			list_for_each_entry(copp, &adm->copps_list, node) {
 				if ((port_idx == copp->afe_port) && (copp_idx == copp->copp_idx)) {
@@ -239,7 +262,8 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		}
 		return 0;
 	}
-	case ADM_CMDRSP_DEVICE_OPEN_V5: {
+	case ADM_CMDRSP_DEVICE_OPEN_V5:
+	case ADM_CMDRSP_DEVICE_OPEN_V8: {
 		struct adm_cmd_rsp_device_open_v5 {
 			u32 status;
 			u16 copp_id;
@@ -323,9 +347,9 @@ static struct q6copp *q6adm_find_matching_copp(struct q6adm *adm,
 	return ret;
 }
 
-static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
-			     int port_id, int path, int topology,
-			     int channel_mode, int bit_width, int rate)
+static int q6adm_device_open_v5(struct q6adm *adm, struct q6copp *copp,
+				int port_id, int path, int topology,
+				int channel_mode, int bit_width, int rate)
 {
 	struct q6adm_cmd_device_open_v5 *open;
 	int afe_port = q6afe_get_port_id(port_id);
@@ -360,6 +384,61 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 		return ret;
 
 	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V5);
+}
+
+static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
+			     int port_id, int path, int topology,
+			     int channel_mode, int bit_width, int rate)
+{
+	struct q6adm_cmd_device_open_v8 *open;
+	struct q6adm_device_endpoint_payload *ep;
+	int afe_port = q6afe_get_port_id(port_id);
+	struct apr_pkt *pkt;
+	int ret;
+	int ep_size;
+	int pkt_size;
+
+	if (!of_machine_is_compatible("google,sunfish"))
+		return q6adm_device_open_v5(adm, copp, port_id, path, topology,
+					    channel_mode, bit_width, rate);
+
+	ep_size = 8 + roundup(channel_mode & 0xff, 4);
+	pkt_size = APR_HDR_SIZE + sizeof(*open) + ep_size;
+
+	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	pkt = p;
+	open = p + APR_HDR_SIZE;
+	ep = (void *)open + sizeof(*open);
+	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+					   APR_HDR_LEN(APR_HDR_SIZE),
+					   APR_PKT_VER);
+	pkt->hdr.pkt_size = pkt_size;
+	pkt->hdr.src_port = afe_port;
+	pkt->hdr.dest_port = afe_port;
+	pkt->hdr.token = port_id << 16 | copp->copp_idx;
+	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V8;
+	open->flags = ADM_LEGACY_DEVICE_SESSION;
+	open->mode_of_operation = path;
+	open->topology_id = topology;
+	open->endpoint_id_1 = afe_port;
+	open->endpoint_id_2 = 0xFFFF;
+	open->endpoint_id_3 = 0xFFFF;
+	open->reserved = 0;
+	ep->dev_num_channel = channel_mode & 0x00FF;
+	ep->bit_width = bit_width;
+	ep->sample_rate = rate;
+	ret = q6dsp_map_channels(ep->dev_channel_mapping, channel_mode);
+	if (ret)
+		return ret;
+
+	dev_info(adm->dev,
+		 "ADM OPEN_V8 port=0x%x path=%d topo=0x%x ch=%d bw=%d sr=%d\n",
+		 afe_port, path, topology, channel_mode, bit_width, rate);
+
+	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V8);
 }
 
 /**

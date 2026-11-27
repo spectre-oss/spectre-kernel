@@ -3,9 +3,13 @@
 // Copyright (c) 2018, Linaro Limited
 
 #include <dt-bindings/sound/qcom,q6afe.h>
+#include <linux/bitfield.h>
+#include <linux/bits.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -278,6 +282,31 @@ static int q6tdm_hw_params(struct snd_pcm_substream *substream,
 	tdm->data_align_type = dai_data->priv[dai->id].data_align;
 	tdm->sync_src = dai_data->priv[dai->id].sync_src;
 	tdm->sync_mode = dai_data->priv[dai->id].sync_mode;
+	tdm->data_out_enable = dai_data->priv[dai->id].data_out_enable;
+	tdm->invert_sync = dai_data->priv[dai->id].invert_sync;
+	tdm->data_delay = dai_data->priv[dai->id].data_delay;
+	if (of_machine_is_compatible("google,sunfish")) {
+		if (tdm->slot_width && tdm->bit_width < tdm->slot_width)
+			tdm->bit_width = tdm->slot_width;
+		/* AOSP sunfish SEC TDM: 8 × 32-bit slots, first two used. */
+		if (!tdm->nslots_per_frame) {
+			tdm->nslots_per_frame = 8;
+			tdm->slot_width = 32;
+			tdm->slot_mask = 0x3;
+		}
+		if (tdm->num_channels >= 1 && tdm->ch_mapping[0] == 0 &&
+		    tdm->ch_mapping[1] == 0) {
+			int i;
+
+			tdm->ch_mapping[0] = 0;
+			if (tdm->num_channels >= 2)
+				tdm->ch_mapping[1] = tdm->slot_width ?
+					tdm->slot_width / 8 : 4;
+			for (i = tdm->num_channels;
+			     i < AFE_PORT_MAX_AUDIO_CHAN_CNT; i++)
+				tdm->ch_mapping[i] = Q6AFE_CMAP_INVALID;
+		}
+	}
 
 	return 0;
 }
@@ -367,6 +396,69 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 
 	return 0;
 }
+/*
+ * Stock SCK is LPI gpio8–11 at 0x62b48000 (func3/3/4/2). Mapping
+ * 0x62b40000/0x20000 hung USB. 16K after ADSP is OK. No userspace mmap.
+ */
+#define SUNFISH_LPI_GPIO8_CFG	0x62b48000UL
+#define SUNFISH_LPI_GPIO_PAGE	0x1000UL
+#define SUNFISH_LPI_GPIO_NPINS	4
+
+static void sunfish_lpi_sec_tdm_mux(struct device *dev)
+{
+	static const u32 funcs[SUNFISH_LPI_GPIO_NPINS] = { 3, 3, 4, 2 };
+	static const char * const names[SUNFISH_LPI_GPIO_NPINS] = {
+		"gpio8", "gpio9", "gpio10", "gpio11"
+	};
+	void __iomem *base;
+	int i;
+
+	base = ioremap(SUNFISH_LPI_GPIO8_CFG,
+		       SUNFISH_LPI_GPIO_PAGE * SUNFISH_LPI_GPIO_NPINS);
+	if (!base) {
+		dev_err(dev, "LPI gpio8-11 ioremap failed\n");
+		return;
+	}
+
+	for (i = 0; i < SUNFISH_LPI_GPIO_NPINS; i++) {
+		void __iomem *cfg = base + i * SUNFISH_LPI_GPIO_PAGE;
+		void __iomem *val = cfg + 4;
+		u32 old = readl(cfg);
+		u32 new = old;
+
+		new &= ~(GENMASK(1, 0) | GENMASK(5, 2) | GENMASK(8, 6) | BIT(9));
+		new |= FIELD_PREP(GENMASK(5, 2), funcs[i]);
+		new |= FIELD_PREP(GENMASK(8, 6), 3); /* 8 mA */
+		new |= BIT(9);
+		writel(new, cfg);
+		writel(readl(val) | BIT(1), val);
+		dev_info(dev,
+			 "LPI %s CFG 0x%08x -> 0x%08x (rb 0x%08x) VAL=0x%08x\n",
+			 names[i], old, new, readl(cfg), readl(val));
+	}
+	iounmap(base);
+}
+
+static int sunfish_sec_tdm_tx0_get(struct snd_soc_dai *dai)
+{
+	struct q6afe_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	int tx = SECONDARY_TDM_TX_0;
+	struct q6afe_port *port;
+
+	if (dai_data->port[tx])
+		return 0;
+
+	port = q6afe_port_get_from_id(dai->dev, tx);
+	if (IS_ERR(port)) {
+		dev_err(dai->dev, "Unable to get SEC TDM TX_0: %ld\n",
+			PTR_ERR(port));
+		return PTR_ERR(port);
+	}
+	dai_data->port[tx] = port;
+	dev_info(dai->dev, "SEC TDM TX_0 port opened (no DAI link)\n");
+	return 0;
+}
+
 static void q6afe_dai_shutdown(struct snd_pcm_substream *substream,
 				struct snd_soc_dai *dai)
 {
@@ -381,6 +473,17 @@ static void q6afe_dai_shutdown(struct snd_pcm_substream *substream,
 		dev_err(dai->dev, "fail to close AFE port (%d)\n", rc);
 
 	dai_data->is_port_started[dai->id] = false;
+
+	if (of_machine_is_compatible("google,sunfish") &&
+	    dai->id == SECONDARY_TDM_RX_0 &&
+	    dai_data->is_port_started[SECONDARY_TDM_TX_0] &&
+	    dai_data->port[SECONDARY_TDM_TX_0]) {
+		rc = q6afe_port_stop(dai_data->port[SECONDARY_TDM_TX_0]);
+		if (rc < 0)
+			dev_err(dai->dev, "fail to close SEC TDM TX_0 (%d)\n",
+				rc);
+		dai_data->is_port_started[SECONDARY_TDM_TX_0] = false;
+	}
 
 }
 
@@ -436,6 +539,42 @@ static int q6afe_dai_prepare(struct snd_pcm_substream *substream,
 		break;
 	default:
 		return -EINVAL;
+	}
+
+	/*
+	 * Stock Android: afe_tdm_port_start 0x9011 (SEC TDM TX_0 VI)
+	 * then 0x9010 (RX_0). Not RX_1 (0x9012). Mixer stays RX_0.
+	 * dai@41 has no card link, so ASoC never probes TX_0 — open it here.
+	 */
+	if (of_machine_is_compatible("google,sunfish") &&
+	    dai->id == SECONDARY_TDM_RX_0) {
+		int tx = SECONDARY_TDM_TX_0;
+		struct q6afe_tdm_cfg *txcfg = &dai_data->port_config[tx].tdm;
+
+		sunfish_lpi_sec_tdm_mux(dai->dev);
+		rc = sunfish_sec_tdm_tx0_get(dai);
+		if (rc)
+			return rc;
+
+		/* Copy RX TDM. TX has no DAI so priv[tx] is zero — overlaying
+		 * it made DSP error 2 on 0x9011. VI does not drive SD.
+		 */
+		*txcfg = dai_data->port_config[dai->id].tdm;
+		txcfg->data_out_enable = 0;
+
+		if (dai_data->is_port_started[tx]) {
+			q6afe_port_stop(dai_data->port[tx]);
+			dai_data->is_port_started[tx] = false;
+		}
+		q6afe_tdm_port_prepare(dai_data->port[tx], txcfg);
+		rc = q6afe_port_start(dai_data->port[tx]);
+		if (rc < 0) {
+			dev_err(dai->dev, "fail to start SEC TDM TX_0 0x9011 (%d); RX_0 anyway\n",
+				rc);
+		} else {
+			dai_data->is_port_started[tx] = true;
+			dev_info(dai->dev, "SEC TDM TX_0 0x9011 started before RX_0\n");
+		}
 	}
 
 	rc = q6afe_port_start(dai_data->port[dai->id]);
@@ -510,6 +649,7 @@ static int q6afe_mi2s_set_sysclk(struct snd_soc_dai *dai,
 					     Q6AFE_LPASS_CLK_ROOT_DEFAULT,
 					     freq, dir);
 	case Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT ... Q6AFE_LPASS_CLK_ID_QUIN_TDM_EBIT:
+		/* AOSP tdm_clk_set default is INVERT_COUPLE_NO. */
 		return q6afe_port_set_sysclk(port, clk_id,
 					     Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO,
 					     Q6AFE_LPASS_CLK_ROOT_DEFAULT,

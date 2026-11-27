@@ -40,6 +40,7 @@
 #define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2	0x00010DA3
 #define ASM_SESSION_CMD_RUN_V2			0x00010DAA
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2	0x00010DA5
+#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V4	0x0001320C
 #define ASM_MEDIA_FMT_MP3			0x00010BE9
 #define ASM_MEDIA_FMT_FLAC			0x00010C16
 #define ASM_MEDIA_FMT_WMA_V9			0x00010DA8
@@ -97,6 +98,19 @@ struct asm_multi_channel_pcm_fmt_blk_v2 {
 	u16 is_signed;
 	u16 reserved;
 	u8 channel_mapping[PCM_MAX_NUM_CHANNEL];
+} __packed;
+
+/* sunfish 4.14 apr_audio-v2.h: 16/24/32 + sample_word_size + mode */
+struct asm_multi_channel_pcm_fmt_blk_v4 {
+	struct asm_data_cmd_media_fmt_update_v2 fmt_blk;
+	u16 num_channels;
+	u16 bits_per_sample;
+	u32 sample_rate;
+	u16 is_signed;
+	u16 sample_word_size;
+	u8 channel_mapping[8];
+	u16 endianness;
+	u16 mode;
 } __packed;
 
 struct asm_flac_fmt_blk_v2 {
@@ -891,7 +905,9 @@ static int q6asm_ac_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt)
 		goto err;
 
 	rc = wait_event_timeout(ac->cmd_wait,
-				(ac->result.opcode == hdr->opcode), 5 * HZ);
+				(ac->result.opcode == hdr->opcode),
+				of_machine_is_compatible("google,sunfish") ?
+				HZ : 5 * HZ);
 	if (!rc) {
 		dev_err(ac->dev, "CMD %x timeout\n", hdr->opcode);
 		rc =  -ETIMEDOUT;
@@ -955,7 +971,12 @@ int q6asm_open_write(struct audio_client *ac, uint32_t stream_id,
 		open->dec_fmt_id = ASM_MEDIA_FMT_MP3;
 		break;
 	case FORMAT_LINEAR_PCM:
-		open->dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
+		/* 4.14 OPEN_WRITE_V3: 16/24 with V2. Sunfish 32-bit uses PCM V4. */
+		if (of_machine_is_compatible("google,sunfish") &&
+		    bits_per_sample == 32)
+			open->dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V4;
+		else
+			open->dec_fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2;
 		break;
 	case SND_AUDIOCODEC_FLAC:
 		open->dec_fmt_id = ASM_MEDIA_FMT_FLAC;
@@ -989,6 +1010,12 @@ int q6asm_open_write(struct audio_client *ac, uint32_t stream_id,
 		rc = -EINVAL;
 		goto err;
 	}
+
+	if (of_machine_is_compatible("google,sunfish"))
+		dev_info(ac->dev,
+			 "OPEN_WRITE_V3 bps=%u fmt=0x%x dec=0x%x popp=0x%x\n",
+			 bits_per_sample, format, open->dec_fmt_id,
+			 open->postprocopo_id);
 
 	rc = q6asm_ac_send_cmd_sync(ac, pkt);
 	if (rc < 0)
@@ -1088,30 +1115,47 @@ int q6asm_media_format_block_multi_ch_pcm(struct audio_client *ac,
 					  uint16_t bits_per_sample)
 {
 	struct asm_multi_channel_pcm_fmt_blk_v2 *fmt;
+	struct asm_multi_channel_pcm_fmt_blk_v4 *fmt4;
 	struct apr_pkt *pkt;
 	u8 *channel_mapping;
-	int pkt_size = APR_HDR_SIZE + sizeof(*fmt);
+	int pkt_size;
+	bool use_v4 = of_machine_is_compatible("google,sunfish") &&
+		      bits_per_sample == 32;
+
+	pkt_size = APR_HDR_SIZE + (use_v4 ? sizeof(*fmt4) : sizeof(*fmt));
 
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 
 	pkt = p;
-	fmt = p + APR_HDR_SIZE;
-
 	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, true, stream_id);
-
 	pkt->hdr.opcode = ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2;
-	fmt->fmt_blk.fmt_blk_size = sizeof(*fmt) - sizeof(fmt->fmt_blk);
-	fmt->num_channels = channels;
-	fmt->bits_per_sample = bits_per_sample;
-	fmt->sample_rate = rate;
-	fmt->is_signed = 1;
 
-	channel_mapping = fmt->channel_mapping;
+	if (use_v4) {
+		fmt4 = p + APR_HDR_SIZE;
+		fmt4->fmt_blk.fmt_blk_size = sizeof(*fmt4) - sizeof(fmt4->fmt_blk);
+		fmt4->num_channels = channels;
+		fmt4->bits_per_sample = bits_per_sample;
+		fmt4->sample_rate = rate;
+		fmt4->is_signed = 1;
+		fmt4->sample_word_size = 32;
+		fmt4->endianness = 0;
+		fmt4->mode = 31;
+		channel_mapping = fmt4->channel_mapping;
+	} else {
+		fmt = p + APR_HDR_SIZE;
+		fmt->fmt_blk.fmt_blk_size = sizeof(*fmt) - sizeof(fmt->fmt_blk);
+		fmt->num_channels = channels;
+		fmt->bits_per_sample = bits_per_sample;
+		fmt->sample_rate = rate;
+		fmt->is_signed = 1;
+		channel_mapping = fmt->channel_mapping;
+	}
 
 	if (channel_map) {
-		memcpy(channel_mapping, channel_map, PCM_MAX_NUM_CHANNEL);
+		memcpy(channel_mapping, channel_map,
+		       use_v4 ? 8 : PCM_MAX_NUM_CHANNEL);
 	} else {
 		if (q6dsp_map_channels(channel_mapping, channels)) {
 			dev_err(ac->dev, " map channels failed %d\n", channels);

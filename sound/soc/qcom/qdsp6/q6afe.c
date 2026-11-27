@@ -40,11 +40,16 @@
 
 #define AFE_PARAM_ID_LPAIF_CLK_CONFIG	0x00010238
 #define AFE_PARAM_ID_INT_DIGITAL_CDC_CLK_CONFIG	0x00010239
+/* CAF q6afe-v2.h: LPI ports need this before DEVICE_START. */
+#define AFE_PARAM_ID_ISLAND_CONFIG	0x000102EB
+#define AFE_API_VERSION_ISLAND_CONFIG	1
 
 #define AFE_PARAM_ID_SLIMBUS_CONFIG    0x00010212
 #define AFE_PARAM_ID_I2S_CONFIG	0x0001020D
 #define AFE_PARAM_ID_TDM_CONFIG	0x0001029D
 #define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG	0x00010297
+/* CAF: after GROUP 0x1029E. Lane 0 = SD0 (gpio10). Continue if DSP rejects. */
+#define AFE_PARAM_ID_TDM_LANE_CONFIG	0x0001029F
 #define AFE_PARAM_ID_CODEC_DMA_CONFIG	0x000102B8
 #define AFE_PARAM_ID_USB_AUDIO_CONFIG    0x000102A4
 #define AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST	0x000100f4
@@ -376,6 +381,7 @@
 
 #define Q6AFE_LPASS_MODE_CLK1_VALID 1
 #define Q6AFE_LPASS_MODE_CLK2_VALID 2
+#define Q6AFE_LPASS_MODE_BOTH_VALID 3
 #define Q6AFE_LPASS_CLK_SRC_INTERNAL 1
 #define Q6AFE_LPASS_CLK_ROOT_DEFAULT 0
 #define AFE_API_VERSION_TDM_CONFIG              1
@@ -383,6 +389,7 @@
 #define AFE_API_VERSION_CODEC_DMA_CONFIG	1
 
 #define TIMEOUT_MS 3000
+#define SUNFISH_TIMEOUT_MS 1000
 #define AFE_CMD_RESP_AVAIL	0
 #define AFE_CMD_RESP_NONE	1
 #define AFE_CLK_TOKEN		1024
@@ -397,7 +404,6 @@ struct q6afe {
 	wait_queue_head_t wait;
 	struct list_head port_list;
 	spinlock_t port_list_lock;
-	uint32_t lpass_hw_core_client_hdl[Q6AFE_LPASS_CORE_HW_VOTE_MAX];
 };
 
 struct afe_port_cmd_device_start {
@@ -485,6 +491,12 @@ struct afe_param_id_slimbus_cfg {
  */
 } __packed;
 
+/*
+ * AOSP 4.14 afe_clk_cfg (apr_audio-v2.h). This MBN 0x10238 handler
+ * (0xb05772a0) loads clk_src as memuh(+0xc) and mode as memuh(+0x10).
+ * All-u32 packing put mode at +0x14 so DSP saw mode=0 (clk_root) and
+ * skipped CLK1/CLK2. Size 20 > 0x13. Do not confuse with TDM 48B packing.
+ */
 struct afe_clk_cfg {
 	u32                  i2s_cfg_minor_version;
 	u32                  clk_val1;
@@ -500,6 +512,11 @@ struct afe_digital_clk_cfg {
 	u32                  clk_val;
 	u16                  clk_root;
 	u16                  reserved;
+} __packed;
+
+struct afe_param_id_island_cfg {
+	u32 island_cfg_minor_version;
+	u32 island_enable;
 } __packed;
 
 struct afe_param_id_i2s_cfg {
@@ -638,7 +655,7 @@ struct afe_clk_set {
 	uint16_t clk_attri;
 	uint16_t clk_root;
 	uint32_t enable;
-};
+} __packed;
 
 struct afe_param_id_slot_mapping_cfg {
 	u32	minor_version;
@@ -1111,8 +1128,11 @@ static int afe_apr_send_pkt(struct q6afe *afe, struct apr_pkt *pkt,
 	}
 
 	ret = wait_event_timeout(*wait, (result->opcode == rsp_opcode),
-				 msecs_to_jiffies(TIMEOUT_MS));
+				 msecs_to_jiffies(
+					 of_machine_is_compatible("google,sunfish") ?
+					 SUNFISH_TIMEOUT_MS : TIMEOUT_MS));
 	if (!ret) {
+		dev_err(afe->dev, "AFE opcode %x no APR reply\n", rsp_opcode);
 		ret = -ETIMEDOUT;
 	} else if (result->status > 0) {
 		dev_err(afe->dev, "DSP returned error[%x]\n",
@@ -1229,20 +1249,49 @@ static int q6afe_port_set_param_v2(struct q6afe_port *port, void *data,
 	return ret;
 }
 
+static int q6afe_port_set_lpass_clock_on(struct q6afe_port *port, u16 port_id,
+					 struct afe_clk_cfg *cfg)
+{
+	u16 saved = port->id;
+	int ret;
+
+	if (of_machine_is_compatible("google,sunfish"))
+		dev_info(port->afe->dev,
+			 "LPAIF_CLK_CONFIG port=0x%x val1=%u val2=%u src=%u root=%u mode=%u bytes=%zu\n",
+			 port_id, cfg->clk_val1, cfg->clk_val2, cfg->clk_src,
+			 cfg->clk_root, cfg->clk_set_mode, sizeof(*cfg));
+	port->id = port_id;
+	ret = q6afe_port_set_param_v2(port, cfg,
+				      AFE_PARAM_ID_LPAIF_CLK_CONFIG,
+				      AFE_MODULE_AUDIO_DEV_INTERFACE,
+				      sizeof(*cfg));
+	port->id = saved;
+	return ret;
+}
+
 static int q6afe_port_set_lpass_clock(struct q6afe_port *port,
 				 struct afe_clk_cfg *cfg)
 {
-	return q6afe_port_set_param_v2(port, cfg,
-				       AFE_PARAM_ID_LPAIF_CLK_CONFIG,
-				       AFE_MODULE_AUDIO_DEV_INTERFACE,
-				       sizeof(*cfg));
+	return q6afe_port_set_lpass_clock_on(port, port->id, cfg);
 }
 
 static int q6afe_set_lpass_clock_v2(struct q6afe_port *port,
 				 struct afe_clk_set *cfg)
 {
-	return q6afe_port_set_param(port, cfg, AFE_PARAM_ID_CLOCK_SET,
-				    AFE_MODULE_CLOCK_SET, sizeof(*cfg));
+	if (!of_machine_is_compatible("google,sunfish"))
+		return q6afe_port_set_param(port, cfg, AFE_PARAM_ID_CLOCK_SET,
+					    AFE_MODULE_CLOCK_SET, sizeof(*cfg));
+
+	dev_info(port->afe->dev,
+		 "CLOCK_SET v2 id=0x%x hz=%u attri=%u en=%u token=clk\n",
+		 cfg->clk_id, cfg->clk_freq_in_hz, cfg->clk_attri,
+		 cfg->enable);
+	/* 4.14 afe_set_lpass_clock_v2: AFE_SVC_CMD_SET_PARAM + CLK token,
+	 * not the TDM port token. Port token ACK'd DalClock without OE.
+	 */
+	return q6afe_set_param(port->afe, NULL, cfg, AFE_PARAM_ID_CLOCK_SET,
+			       AFE_MODULE_CLOCK_SET, sizeof(*cfg),
+			       AFE_CLK_TOKEN);
 }
 
 static int q6afe_set_digital_codec_core_clock(struct q6afe_port *port,
@@ -1267,7 +1316,6 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 	cset.clk_root = clk_root;
 	cset.enable = !!freq;
 
-	printk(KERN_INFO "%s: clk_id=%d, attri=%d, clk_root=%d, freq=%d\n", __func__, clk_id, attri, clk_root, freq);
 	int ret = q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
 			       AFE_MODULE_CLOCK_SET, sizeof(cset),
 			       AFE_CLK_TOKEN);
@@ -1337,6 +1385,8 @@ EXPORT_SYMBOL_GPL(q6afe_port_set_sysclk);
  *
  * Return: Will be an negative on packet size on success.
  */
+static int q6afe_tdm_group_enable(struct q6afe_port *port, bool enable);
+
 int q6afe_port_stop(struct q6afe_port *port)
 {
 	struct afe_port_cmd_device_stop *stop;
@@ -1374,6 +1424,9 @@ int q6afe_port_stop(struct q6afe_port *port)
 	ret = afe_apr_send_pkt(afe, pkt, port, AFE_PORT_CMD_DEVICE_STOP);
 	if (ret)
 		dev_err(afe->dev, "AFE close failed %d\n", ret);
+
+	if (of_machine_is_compatible("google,sunfish"))
+		q6afe_tdm_group_enable(port, false);
 
 	return ret;
 }
@@ -1424,9 +1477,17 @@ void q6afe_tdm_port_prepare(struct q6afe_port *port,
 	pcfg->tdm_cfg.sync_mode = cfg->sync_mode;
 	pcfg->tdm_cfg.sync_src = cfg->sync_src;
 	pcfg->tdm_cfg.nslots_per_frame = cfg->nslots_per_frame;
-
+	pcfg->tdm_cfg.ctrl_data_out_enable = cfg->data_out_enable;
+	pcfg->tdm_cfg.ctrl_invert_sync_pulse = cfg->invert_sync;
+	pcfg->tdm_cfg.ctrl_sync_data_delay = cfg->data_delay;
 	pcfg->tdm_cfg.slot_width = cfg->slot_width;
 	pcfg->tdm_cfg.slot_mask = cfg->slot_mask;
+	dev_info(port->afe->dev,
+		 "TDM port 0x%x ch=%u sr=%u bw=%u slots=%u sw=%u mask=0x%x sync=%u/%u delay=%u dout=%u map=%u/%u\n",
+		 port->id, cfg->num_channels, cfg->sample_rate, cfg->bit_width,
+		 cfg->nslots_per_frame, cfg->slot_width, cfg->slot_mask,
+		 cfg->sync_mode, cfg->sync_src, cfg->data_delay,
+		 cfg->data_out_enable, cfg->ch_mapping[0], cfg->ch_mapping[1]);
 	port->scfg = kzalloc_obj(*port->scfg);
 	if (!port->scfg)
 		return;
@@ -1584,9 +1645,7 @@ int q6afe_i2s_port_prepare(struct q6afe_port *port, struct q6afe_i2s_cfg *cfg)
 		break;
 	}
 
-	// FINDME this is pretty close to downstream msm_dai_q6_mi2s_get_lineconfig
 	num_sd_lines = hweight_long(cfg->sd_line_mask);
-	printk(KERN_ERR "%s:%d num_sd_lines=0x%x cfg->sd_line_mask=0x%x\n", __func__, __LINE__, num_sd_lines, cfg->sd_line_mask);
 
 	switch (num_sd_lines) {
 	case 0:
@@ -1695,7 +1754,6 @@ int q6afe_i2s_port_prepare(struct q6afe_port *port, struct q6afe_i2s_cfg *cfg)
 		break;
 	}
 
-	printk(KERN_ERR "%s:%d DBG num_sd_lines=0x%x mono_stereo=0x%x channel_mode=0x%x\n", __func__, __LINE__, num_sd_lines, pcfg->i2s_cfg.mono_stereo, pcfg->i2s_cfg.channel_mode);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(q6afe_i2s_port_prepare);
@@ -1722,6 +1780,158 @@ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
 		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
 }
 EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
+#define AFE_MODULE_GROUP_DEVICE			0x00010254
+#define AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG	0x0001029E
+#define AFE_PARAM_ID_GROUP_DEVICE_ENABLE	0x00010256
+#define AFE_API_VERSION_GROUP_DEVICE_TDM_CONFIG	0x1
+#define AFE_GROUP_DEVICE_NUM_PORTS		8
+#define AFE_PORT_INVALID			0xFFFF
+#define AFE_GROUP_DEVICE_ID_SECONDARY_TDM_RX \
+	(AFE_PORT_ID_SECONDARY_TDM_RX + 0x100)
+
+struct afe_param_id_group_device_tdm_cfg {
+	u32 group_device_cfg_minor_version;
+	u16 group_id;
+	u16 reserved;
+	u16 port_id[AFE_GROUP_DEVICE_NUM_PORTS];
+	u32 num_channels;
+	u32 sample_rate;
+	u32 bit_width;
+	u16 nslots_per_frame;
+	u16 slot_width;
+	u32 slot_mask;
+} __packed;
+
+struct afe_group_device_enable {
+	u16 group_id;
+	u16 enable;
+} __packed;
+
+static int q6afe_tdm_group_enable(struct q6afe_port *port, bool enable)
+{
+	struct q6afe *afe = port->afe;
+	struct afe_param_id_tdm_cfg *tdm = &port->port_cfg.tdm_cfg;
+	struct afe_param_id_group_device_tdm_cfg gcfg = {0};
+	struct afe_group_device_enable genb = {0};
+	u16 gid = AFE_GROUP_DEVICE_ID_SECONDARY_TDM_RX;
+	int i, ret;
+
+	/*
+	 * Sunfish mixer is SEC_TDM_RX_0 only. Grouping 8 member ports
+	 * (id 0x9110) ACK'd while CS35 never saw SCK. Skip until 4.14
+	 * is shown to group this DAI.
+	 */
+	if (port->id == AFE_PORT_ID_SECONDARY_TDM_RX) {
+		dev_info(afe->dev, "TDM GROUP skip enable=%u (single port)\n",
+			 enable);
+		return 0;
+	}
+
+	if (port->id != AFE_PORT_ID_SECONDARY_TDM_RX)
+		return 0;
+
+	if (enable) {
+		gcfg.group_device_cfg_minor_version =
+			AFE_API_VERSION_GROUP_DEVICE_TDM_CONFIG;
+		gcfg.group_id = gid;
+		for (i = 0; i < AFE_GROUP_DEVICE_NUM_PORTS; i++)
+			gcfg.port_id[i] = AFE_PORT_ID_SECONDARY_TDM_RX + (i * 2);
+		gcfg.num_channels = tdm->num_channels;
+		gcfg.sample_rate = tdm->sample_rate;
+		gcfg.bit_width = tdm->bit_width;
+		gcfg.nslots_per_frame = tdm->nslots_per_frame;
+		gcfg.slot_width = tdm->slot_width;
+		gcfg.slot_mask = tdm->slot_mask;
+		dev_info(afe->dev,
+			 "TDM GROUP cfg id=0x%x ports=8 ch=%u sr=%u bw=%u slots=%u mask=0x%x\n",
+			 gid, gcfg.num_channels, gcfg.sample_rate,
+			 gcfg.bit_width, gcfg.nslots_per_frame, gcfg.slot_mask);
+		ret = q6afe_set_param(afe, NULL, &gcfg,
+				      AFE_PARAM_ID_GROUP_DEVICE_TDM_CONFIG,
+				      AFE_MODULE_GROUP_DEVICE, sizeof(gcfg),
+				      AFE_CLK_TOKEN);
+		if (ret)
+			dev_err(afe->dev, "TDM GROUP cfg failed %d\n", ret);
+	}
+
+	genb.group_id = gid;
+	genb.enable = enable;
+	dev_info(afe->dev, "TDM GROUP enable=%u id=0x%x\n", enable, gid);
+	ret = q6afe_set_param(afe, NULL, &genb,
+			      AFE_PARAM_ID_GROUP_DEVICE_ENABLE,
+			      AFE_MODULE_GROUP_DEVICE, sizeof(genb),
+			      AFE_CLK_TOKEN);
+	if (ret)
+		dev_err(afe->dev, "TDM GROUP enable %u failed %d\n",
+			enable, ret);
+	return ret;
+}
+
+/*
+ * Fabia PLL lock wait in Clock FWK uses HWIO + NPA. MACRO (block 3)
+ * already ACK'd. AVTIMER is in-tree block 2 (not DCODEC 4). Vote it
+ * at play, not splash. Do not mmap 0x62c/0x62d. Do not invent clk ids.
+ */
+static int q6afe_vote_hw_block(struct q6afe *afe, u32 block, const char *name)
+{
+	struct afe_cmd_remote_lpass_core_hw_vote_request *vote_cfg;
+	struct apr_pkt *pkt;
+	int pkt_size = APR_HDR_SIZE + sizeof(*vote_cfg);
+	int ret;
+
+	if (block >= Q6AFE_LPASS_CORE_HW_VOTE_MAX)
+		return -EINVAL;
+
+	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	pkt = p;
+	vote_cfg = p + APR_HDR_SIZE;
+	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+					   APR_HDR_LEN(APR_HDR_SIZE),
+					   APR_PKT_VER);
+	pkt->hdr.pkt_size = pkt_size;
+	pkt->hdr.src_port = 0;
+	pkt->hdr.dest_port = 0;
+	pkt->hdr.token = block;
+	pkt->hdr.opcode = AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST;
+	vote_cfg->hw_block_id = block;
+	strscpy(vote_cfg->client_name, name, sizeof(vote_cfg->client_name));
+	ret = afe_apr_send_pkt(afe, pkt, NULL,
+			       AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST);
+	if (ret)
+		dev_err(afe->dev, "LPASS HW vote block=%u: %d\n", block, ret);
+	else
+		dev_info(afe->dev, "LPASS HW vote block=%u handle=%u client=%s\n",
+			 block, afe->vote_result, name);
+	return ret;
+}
+
+/*
+ * Clock FWK node lpass_audio_core_lpaif_sec_ibit_clk (cookies
+ * eec11000 RCG / eec11018 CBCR). AFE 0x202 wrapper is
+ * SetClockFrequency then Enable. Split so ConfigMux programs
+ * HID/div 10 at 12.288 MHz (M/N=0) before CBCR enable.
+ * Do not mmap 0x62d. Do not invent clk ids.
+ */
+static int q6afe_sec_tdm_ibit_clk(struct q6afe_port *port, bool enable)
+{
+	struct afe_clk_set cset = {0};
+	int ret;
+
+	cset.clk_set_minor_version = AFE_API_VERSION_CLOCK_SET;
+	cset.clk_id = Q6AFE_LPASS_CLK_ID_SEC_TDM_IBIT;
+	cset.clk_freq_in_hz = 12288000;
+	cset.clk_attri = Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO;
+	cset.clk_root = Q6AFE_LPASS_CLK_ROOT_DEFAULT;
+	cset.enable = enable;
+	ret = q6afe_set_lpass_clock_v2(port, &cset);
+	dev_info(port->afe->dev, "CLOCK_SET 0x202 12.288 enable=%u: %d\n",
+		 enable, ret);
+	return ret;
+}
+
 /**
  * q6afe_port_start() - Start a afe port
  *
@@ -1736,11 +1946,45 @@ int q6afe_port_start(struct q6afe_port *port)
 	int port_id = port->id;
 	int ret, param_id = port->cfg_type;
 	struct apr_pkt *pkt;
-	int pkt_size;
+	int pkt_size, psize = sizeof(port->port_cfg);
+	bool sunfish = of_machine_is_compatible("google,sunfish");
+
+	if (sunfish &&
+	    (port_id == AFE_PORT_ID_SECONDARY_TDM_RX ||
+	     port_id == AFE_PORT_ID_SECONDARY_TDM_TX)) {
+		q6afe_vote_hw_block(afe, Q6AFE_LPASS_CORE_AVTIMER_BLOCK,
+				    "TDM_AVT");
+		q6afe_sec_tdm_ibit_clk(port, false);
+		q6afe_sec_tdm_ibit_clk(port, true);
+		/*
+		 * 0x10238: on 0x9010 the handler returns 0 unread (MI2S
+		 * port gate). On 0x1002 it votes TER IBIT (HalClk id 4),
+		 * not SEC (id 3). Both are DalClock/pBases=0. Do not send.
+		 * Do not DEVICE_START MI2S on the TDM path.
+		 */
+		dev_info(afe->dev,
+			 "LPAIF_CLK_CONFIG skip (0x10238 gated on 0x9010/0x9011, 0x1002=TER)\n");
+	}
+
+	if (sunfish) {
+		switch (param_id) {
+		case AFE_PARAM_ID_TDM_CONFIG:
+			psize = sizeof(port->port_cfg.tdm_cfg);
+			/* 4.14: group cfg+enable before member ports start (clocks LPAIF). */
+			q6afe_tdm_group_enable(port, true);
+			break;
+		case AFE_PARAM_ID_I2S_CONFIG:
+			psize = sizeof(port->port_cfg.i2s_cfg);
+			break;
+		default:
+			psize = sizeof(port->port_cfg);
+			break;
+		}
+	}
 
 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
-				       sizeof(port->port_cfg));
+				       psize);
 	if (ret) {
 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
 			port_id, ret);
@@ -1756,6 +2000,30 @@ int q6afe_port_start(struct q6afe_port *port)
 			port_id, ret);
 			return ret;
 		}
+	}
+
+	/* 0x0001029F TDM LANE_CONFIG → DSP error 2 on this MBN. Do not retry. */
+
+	/*
+	 * Island on SEC TDM ACK'd while SCK stayed DC. MBN island is DMA
+	 * sleep, not IBIT. Skip until 4.14 is shown to send 0x000102EB here.
+	 */
+	if (sunfish && port_id == AFE_PORT_ID_SECONDARY_MI2S_RX) {
+		struct afe_param_id_island_cfg icfg = {
+			.island_cfg_minor_version = AFE_API_VERSION_ISLAND_CONFIG,
+			.island_enable = 1,
+		};
+
+		dev_info(afe->dev, "ISLAND_CONFIG port=0x%x enable=1\n",
+			 port_id);
+		ret = q6afe_port_set_param_v2(port, &icfg,
+					      AFE_PARAM_ID_ISLAND_CONFIG,
+					      AFE_MODULE_AUDIO_DEV_INTERFACE,
+					      sizeof(icfg));
+		if (ret)
+			dev_err(afe->dev, "ISLAND_CONFIG: %d (continue)\n", ret);
+	} else if (sunfish && port_id == AFE_PORT_ID_SECONDARY_TDM_RX) {
+		dev_info(afe->dev, "ISLAND_CONFIG skip port=0x%x\n", port_id);
 	}
 
 	pkt_size = APR_HDR_SIZE + sizeof(*start);
@@ -1781,6 +2049,20 @@ int q6afe_port_start(struct q6afe_port *port)
 	if (ret)
 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
 			port_id, ret);
+
+	/*
+	 * LPI gpio8 is already OE+mux during play; SCK still DC. Re-vote
+	 * SEC TDM IBIT after PCM_CTL DEVICE_START.
+	 */
+	if (sunfish && !ret && port_id == AFE_PORT_ID_SECONDARY_TDM_RX) {
+		int clk_ret = q6afe_port_set_sysclk(port,
+			Q6AFE_LPASS_CLK_ID_SEC_TDM_IBIT,
+			Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO,
+			Q6AFE_LPASS_CLK_ROOT_DEFAULT,
+			12288000, 0);
+		dev_info(afe->dev, "CLOCK_SET 0x202 after START: %d\n",
+			 clk_ret);
+	}
 
 	return ret;
 }
@@ -1990,8 +2272,11 @@ int q6afe_vote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
 			       AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST);
 	if (ret)
 		dev_err(afe->dev, "AFE failed to vote (%d)\n", hw_block_id);
-	else
+	else {
 		*client_handle = afe->vote_result;
+		dev_info(afe->dev, "LPASS HW vote block=%u handle=%u client=%s\n",
+			 hw_block_id, *client_handle, client_name);
+	}
 
 	return ret;
 }
@@ -2016,7 +2301,6 @@ static int q6afe_probe(struct apr_device *adev)
 
 	dev_set_drvdata(dev, afe);
 
-	printk(KERN_ERR "%s:%d DBG\n", __func__, __LINE__);
 	return devm_of_platform_populate(dev);
 }
 

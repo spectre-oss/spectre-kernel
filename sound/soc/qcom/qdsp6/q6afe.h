@@ -116,6 +116,8 @@
 #define Q6AFE_LPASS_CLK_ID_QUIN_TDM_EBIT                          0x209
 /** Clock ID for Quinary TDM OSR */
 #define Q6AFE_LPASS_CLK_ID_QUIN_TDM_OSR                           0x20A
+/* DalClock audio_core_lpaif_pcm_data_oe_clk (sunfish adsp.mbn table). */
+#define Q6AFE_LPASS_CLK_ID_PCM_DATA_OE                            0x20000
 
 /* Clock ID for MCLK1 */
 #define Q6AFE_LPASS_CLK_ID_MCLK_1                                 0x300
@@ -193,6 +195,9 @@ struct q6afe_tdm_cfg {
 	u16	nslots_per_frame;
 	u16	slot_width;
 	u16	slot_mask;
+	u16	data_out_enable;
+	u16	invert_sync;
+	u16	data_delay;
 	u32	data_align_type;
 	u16	ch_mapping[AFE_MAX_CHAN_COUNT];
 };

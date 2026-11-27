@@ -264,3 +264,13 @@ config SND_SOC_X1E80100
 	  Say Y or M if you want to use audio device on this SoCs.
 
 endif #SND_SOC_QCOM
+
+config SND_SOC_QDSP6_Q6VOICE
+	tristate "Qualcomm QDSP6 cellular voice sessions"
+	depends on SND_SOC_QDSP6
+	help
+	  Hostless modem voice through MVM/CVS/CVP and existing AFE ports.
+
+config SND_SOC_QDSP6_Q6VOICE_DAI
+	tristate "Qualcomm QDSP6 cellular voice frontend"
+	depends on SND_SOC_QDSP6_Q6VOICE

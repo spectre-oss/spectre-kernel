@@ -422,7 +422,8 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 	session->bits_per_sample = pdata->bits_per_sample;
 
 	payload.num_copps = 0; /* only RX needs to use payload */
-	topology = NULL_COPP_TOPOLOGY;
+	topology = of_machine_is_compatible("google,sunfish") ?
+		DEFAULT_COPP_TOPOLOGY : NULL_COPP_TOPOLOGY;
 	copp = q6adm_open(routing_data->dev, session->port_id,
 			      session->path_type, session->sample_rate,
 			      session->channels, topology, perf_mode,
@@ -1165,12 +1166,18 @@ static int routing_hw_params(struct snd_soc_component *component,
 
 	switch (params_format(params)) {
 	case SNDRV_PCM_FORMAT_S16_LE:
-			session->bits_per_sample = 16;
+		session->bits_per_sample = 16;
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
-			session->bits_per_sample = 24;
+	case SNDRV_PCM_FORMAT_S24_3LE:
+		session->bits_per_sample = 24;
+		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
+		session->bits_per_sample = 32;
 		break;
 	default:
+		if (!session->bits_per_sample)
+			session->bits_per_sample = 16;
 		break;
 	}
 

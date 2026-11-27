@@ -401,11 +401,16 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		return ret;
 	}
 
+	struct snd_pcm_hardware playback_hw = q6asm_dai_hardware_playback;
+
 	/* DSP expects stream id from 1 */
 	prtd->stream_id = 1;
 
+	if (of_machine_is_compatible("google,sunfish"))
+		playback_hw.formats |= SNDRV_PCM_FMTBIT_S32_LE;
+
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		runtime->hw = q6asm_dai_hardware_playback;
+		runtime->hw = playback_hw;
 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
 		runtime->hw = q6asm_dai_hardware_capture;
 
@@ -442,8 +447,8 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	runtime->private_data = prtd;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		snd_soc_set_runtime_hwparams(substream, &q6asm_dai_hardware_playback);
-		runtime->dma_bytes = q6asm_dai_hardware_playback.buffer_bytes_max;
+		snd_soc_set_runtime_hwparams(substream, &playback_hw);
+		runtime->dma_bytes = playback_hw.buffer_bytes_max;
 	} else {
 		snd_soc_set_runtime_hwparams(substream, &q6asm_dai_hardware_capture);
 		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
@@ -510,6 +515,9 @@ static int q6asm_dai_hw_params(struct snd_soc_component *component,
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
 		prtd->bits_per_sample = 24;
+		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
+		prtd->bits_per_sample = 32;
 		break;
 	}
 
@@ -1283,6 +1291,8 @@ static int of_q6asm_parse_dai_data(struct device *dev,
 
 		dai_drv = &pdata->dais[idx++];
 		*dai_drv = q6asm_fe_dais_template[id];
+		if (of_machine_is_compatible("google,sunfish"))
+			dai_drv->playback.formats |= SNDRV_PCM_FMTBIT_S32_LE;
 
 		ret = of_property_read_u32(node, "direction", &dir);
 		if (ret)
