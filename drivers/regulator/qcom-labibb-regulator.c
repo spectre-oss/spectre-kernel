@@ -95,6 +95,7 @@ struct labibb_regulator {
 	int				sc_count;
 	int				ocp_irq;
 	int				ocp_irq_count;
+	bool				ocp_irq_deferred;
 	int				fatal_count;
 };
 
@@ -312,7 +313,7 @@ static int qcom_labibb_set_ocp(struct regulator_dev *rdev, int lim,
 {
 	struct labibb_regulator *vreg = rdev_get_drvdata(rdev);
 	char *ocp_irq_name;
-	u32 irq_flags = IRQF_ONESHOT;
+	u32 irq_flags = IRQF_ONESHOT | IRQF_NO_AUTOEN;
 	int irq_trig_low, ret;
 
 	/*
@@ -369,9 +370,23 @@ static int qcom_labibb_set_ocp(struct regulator_dev *rdev, int lim,
 	if (ret)
 		return ret;
 
-	return devm_request_threaded_irq(vreg->dev, vreg->ocp_irq, NULL,
-					 qcom_labibb_ocp_isr, irq_flags,
-					 ocp_irq_name, vreg);
+	ret = devm_request_threaded_irq(vreg->dev, vreg->ocp_irq, NULL,
+					qcom_labibb_ocp_isr, irq_flags,
+					ocp_irq_name, vreg);
+	if (ret)
+		return ret;
+
+	/*
+	 * Constraints may enable OCP inside regulator_register(), before probe
+	 * has assigned vreg->rdev. Keep the IRQ disabled until that assignment
+	 * completes; the handler and recovery work both dereference it.
+	 */
+	if (vreg->rdev)
+		enable_irq(vreg->ocp_irq);
+	else
+		vreg->ocp_irq_deferred = true;
+
+	return 0;
 }
 
 /**
@@ -875,6 +890,11 @@ static int qcom_labibb_regulator_probe(struct platform_device *pdev)
 			dev_err(dev, "qcom_labibb: error registering %s : %d\n",
 					reg_data->name, ret);
 			return PTR_ERR(vreg->rdev);
+		}
+
+		if (vreg->ocp_irq_deferred) {
+			vreg->ocp_irq_deferred = false;
+			enable_irq(vreg->ocp_irq);
 		}
 
 		ret = devm_request_threaded_irq(vreg->dev, vreg->sc_irq, NULL,
