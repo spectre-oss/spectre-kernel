@@ -9,6 +9,8 @@
 #ifndef __RT5514_H__
 #define __RT5514_H__
 
+#include <linux/workqueue.h>
+
 #include <linux/clk.h>
 #include <sound/rt5514.h>
 
@@ -255,6 +257,46 @@
 #define RT5514_FIRMWARE1	"rt5514_dsp_fw1.bin"
 #define RT5514_FIRMWARE2	"rt5514_dsp_fw2.bin"
 
+/*
+ * rt5514p (VENDOR_ID1 == 0x80, Google Pixel 4a "sunfish"): the DSP firmware
+ * owns the DMIC -> I2S/TDM capture path. Firmware names, load addresses and
+ * mailbox registers follow the vendor kernel
+ * (android-msm-sunfish-4.14, sound/soc/codecs/rt5514{,-spi}.[ch]).
+ */
+#define RT5514P_FIRMWARE1	"rt5514p_dsp_fw1.bin"
+#define RT5514P_FIRMWARE2	"rt5514p_dsp_fw2.bin"
+#define RT5514P_FIRMWARE3	"rt5514p_dsp_fw3.bin"
+#define RT5514P_FIRMWARE4	"rt5514p_dsp_fw4.bin"
+#define RT5514P_FW_ADDR1	0x4fe00000
+#define RT5514P_FW_ADDR2	0x4ff00000
+#define RT5514P_FW_ADDR3	0x4fe98000
+#define RT5514P_FW_ADDR4	0x4fea8000
+
+#define RT5514_DSP_WOV_TYPE	0x18002fac
+#define RT5514_DSP_FUNC		0x18002fb0
+#define RT5514_DSP_CHRE_INFORM	0x18002fec
+#define RT5514_DSP_FILTER_RESET	0x18001014
+#define RT5514_DSP_STREAMING	0x18002f10
+#define RT5514_BUFFER_ADC_BASE	0x18002fc0
+#define RT5514_BUFFER_ADC_LIMIT	0x18002fc4
+#define RT5514_BUFFER_ADC_WP	0x18002fc8
+
+enum {
+	RT5514_DSP_WOV_BOTH,
+	RT5514_DSP_WOV_HOTWORD,
+	RT5514_DSP_WOV_MUSDET,
+	RT5514_DSP_WOV_NON,
+};
+
+enum {
+	RT5514_DSP_FUNC_WOV,
+	RT5514_DSP_FUNC_WOV_SENSOR,
+	RT5514_DSP_FUNC_WOV_I2S,
+	RT5514_DSP_FUNC_WOV_I2S_SENSOR,
+	RT5514_DSP_FUNC_SUSPEND,
+	RT5514_DSP_FUNC_I2S,
+};
+
 /* System Clock Source */
 enum {
 	RT5514_SCLK_S_MCLK,
@@ -281,6 +323,10 @@ struct rt5514_priv {
 	int pll_out;
 	int dsp_enabled;
 	unsigned int pll3_cal_value;
+	bool v_p;
+	bool dsp_streaming;
+	struct delayed_work unmute_work;
+	struct delayed_work ring_work;
 };
 
 #endif /* __RT5514_H__ */

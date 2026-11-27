@@ -1270,7 +1270,7 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 
 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
 					int_status, int_status & pup_pdn_mask,
-					1000, 100000);
+					1000, 500000);
 		if (ret)
 			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
 
@@ -1285,11 +1285,33 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 			return ret;
 		}
 
+		/*
+		 * PUP_DONE needs ASP BCLK. ASoC DAPM powers the amp *before*
+		 * q6afe DEVICE_START, so the first poll often times out even
+		 * though GLOBAL_EN is already set. Do not fail the path;
+		 * PLL/PUP complete once TERT MI2S clocks start.
+		 */
 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
 					int_status, int_status & pup_pdn_mask,
-					1000, 100000);
-		if (ret)
-			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
+					1000, 500000);
+		if (ret) {
+			unsigned int s1, s3, pll, sp_en, sp_fmt, sp_rate, rxwl, pwr2;
+
+			regmap_read(regmap, CS35L41_IRQ1_STATUS1, &s1);
+			regmap_read(regmap, CS35L41_IRQ1_STATUS3, &s3);
+			regmap_read(regmap, CS35L41_PWR_CTRL1, &pwr_ctrl1);
+			regmap_read(regmap, CS35L41_PWR_CTRL2, &pwr2);
+			regmap_read(regmap, CS35L41_PLL_CLK_CTRL, &pll);
+			regmap_read(regmap, CS35L41_SP_ENABLES, &sp_en);
+			regmap_read(regmap, CS35L41_SP_FORMAT, &sp_fmt);
+			regmap_read(regmap, CS35L41_SP_RATE_CTRL, &sp_rate);
+			regmap_read(regmap, CS35L41_SP_RX_WL, &rxwl);
+			dev_warn(dev,
+				 "Enable(%d) PUP timeout irq1=0x%x irq3=0x%x pll=0x%x pwr1=0x%x pwr2=0x%x sp_en=0x%x fmt=0x%x rate=0x%x rxwl=0x%x\n",
+				 enable, s1, s3, pll, pwr_ctrl1, pwr2, sp_en, sp_fmt,
+				 sp_rate, rxwl);
+			ret = 0;
+		}
 
 		/* Clear PUP/PDN status */
 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);

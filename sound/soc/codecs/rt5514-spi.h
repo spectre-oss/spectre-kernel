@@ -17,6 +17,9 @@
 #define RT5514_BUFFER_VOICE_BASE	0x18000200
 #define RT5514_BUFFER_VOICE_LIMIT	0x18000204
 #define RT5514_BUFFER_VOICE_WP		0x1800020c
+#define RT5514P_BUFFER_VOICE_BASE	0x18002fb4
+#define RT5514P_BUFFER_VOICE_LIMIT	0x18002fb8
+#define RT5514P_BUFFER_VOICE_WP		0x18002fbc
 #define RT5514_IRQ_CTRL			0x18002094
 
 #define RT5514_IRQ_STATUS_BIT		(0x1 << 5)
@@ -33,5 +36,6 @@ enum {
 
 int rt5514_spi_burst_read(unsigned int addr, u8 *rxbuf, size_t len);
 int rt5514_spi_burst_write(u32 addr, const u8 *txbuf, size_t len);
+void rt5514_spi_stream_hold(bool enable, bool v_p);
 
 #endif /* __RT5514_SPI_H__ */

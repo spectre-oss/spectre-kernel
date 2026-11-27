@@ -514,12 +514,12 @@ static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		/* GLOBAL_EN waits for PUP_DONE which needs ASP BCLK. ASoC
+		 * DAPM runs before q6afe DEVICE_START, so enable in DAI trigger.
+		 */
 		regmap_multi_reg_write_bypassed(cs35l41->regmap,
 						cs35l41_pup_patch,
 						ARRAY_SIZE(cs35l41_pup_patch));
-
-		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type,
-					    1, &cs35l41->dsp.cs_dsp);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type,
@@ -859,6 +859,24 @@ static int cs35l41_component_set_sysclk(struct snd_soc_component *component,
 	return 0;
 }
 
+static int cs35l41_pcm_trigger(struct snd_pcm_substream *substream, int cmd,
+			       struct snd_soc_dai *dai)
+{
+	struct cs35l41_private *cs35l41 = snd_soc_component_get_drvdata(dai->component);
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		/* After CPU DAI prepare: TERT MI2S BCLK should be running. */
+		return cs35l41_global_enable(cs35l41->dev, cs35l41->regmap,
+					     cs35l41->hw_cfg.bst_type, 1,
+					     &cs35l41->dsp.cs_dsp);
+	default:
+		return 0;
+	}
+}
+
 static int cs35l41_dai_set_sysclk(struct snd_soc_dai *dai,
 				  int clk_id, unsigned int freq, int dir)
 {
@@ -964,6 +982,7 @@ static const u64 cs35l41_selectable_formats =
 static const struct snd_soc_dai_ops cs35l41_ops = {
 	.set_fmt = cs35l41_set_dai_fmt,
 	.hw_params = cs35l41_pcm_hw_params,
+	.trigger = cs35l41_pcm_trigger,
 	.set_sysclk = cs35l41_dai_set_sysclk,
 	.set_channel_map = cs35l41_set_channel_map,
 	.auto_selectable_formats = &cs35l41_selectable_formats,
@@ -988,14 +1007,15 @@ static struct snd_soc_dai_driver cs35l41_dai[] = {
 			.channels_min = 1,
 			.channels_max = 2,
 			.rates = CS35L41_RATES,
-			.formats = CS35L41_RX_FORMATS,
+			/* sunfish SEC TDM is S32_LE; ASP WL supports 32. */
+			.formats = CS35L41_RX_FORMATS | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.capture = {
 			.stream_name = "AMP Capture",
 			.channels_min = 1,
 			.channels_max = 4,
 			.rates = CS35L41_RATES,
-			.formats = CS35L41_TX_FORMATS,
+			.formats = CS35L41_TX_FORMATS | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &cs35l41_ops,
 		.symmetric_rate = 1,
