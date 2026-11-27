@@ -4,6 +4,8 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/idr.h>
+#include <linux/delay.h>
+#include <linux/module.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -21,6 +23,21 @@
 
 #define NUM_MBS_720P	(((ALIGN(1280, 16)) >> 4) * ((ALIGN(736, 16)) >> 4))
 #define NUM_MBS_4K	(((ALIGN(4096, 16)) >> 4) * ((ALIGN(2304, 16)) >> 4))
+
+/* Temporary SM7150 diagnostic: stop before the numbered stream stage. */
+static unsigned int stream_probe_stop;
+module_param(stream_probe_stop, uint, 0600);
+MODULE_PARM_DESC(stream_probe_stop, "SM7150 stop before stream stage (0 disables)");
+static int stream_checkpoint(struct venus_inst *inst, unsigned int stage,
+                             const char *name)
+{
+ if (!stream_probe_stop || !inst->core->res->dsp_ifaceq)
+  return 0;
+ dev_info(inst->core->dev, "stream checkpoint %u: %s%s\n", stage, name,
+          stage >= stream_probe_stop ? " (stopped)" : "");
+ msleep(250);
+ return stage >= stream_probe_stop ? -ECANCELED : 0;
+}
 
 enum dpb_buf_owner {
 	DRIVER,
@@ -142,12 +159,20 @@ fail:
 }
 EXPORT_SYMBOL_GPL(venus_helper_queue_dpb_bufs);
 
-int venus_helper_free_dpb_bufs(struct venus_inst *inst)
+int venus_helper_free_dpb_bufs(struct venus_inst *inst, bool force)
 {
 	struct intbuf *buf, *n;
 
 	list_for_each_entry_safe(buf, n, &inst->dpbbufs, list) {
-		if (buf->owned_by == FIRMWARE)
+		/*
+		 * During final session teardown the firmware is stopped or
+		 * aborted and will never hand its DPB buffers back, so free
+		 * them unconditionally to avoid leaking CMA memory. Mid-session
+		 * (e.g. dynamic resolution change) firmware-owned buffers must
+		 * still be kept as they are returned later via a buffer-release
+		 * reference event.
+		 */
+		if (!force && buf->owned_by == FIRMWARE)
 			continue;
 		free_dpb_buf(inst, buf);
 	}
@@ -225,7 +250,7 @@ int venus_helper_alloc_dpb_bufs(struct venus_inst *inst)
 
 fail:
 	kfree(buf);
-	venus_helper_free_dpb_bufs(inst);
+	venus_helper_free_dpb_bufs(inst, false);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(venus_helper_alloc_dpb_bufs);
@@ -1562,7 +1587,7 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
 		if (ret)
 			hfi_session_abort(inst);
 
-		venus_helper_free_dpb_bufs(inst);
+		venus_helper_free_dpb_bufs(inst, true);
 
 		venus_pm_load_scale(inst);
 		INIT_LIST_HEAD(&inst->registeredbufs);
@@ -1638,20 +1663,35 @@ int venus_helper_vb2_start_streaming(struct venus_inst *inst)
 {
 	int ret;
 
+	ret = stream_checkpoint(inst, 1, "internal buffers");
+	if (ret)
+		return ret;
 	ret = venus_helper_intbufs_alloc(inst);
 	if (ret)
 		return ret;
 
+	ret = stream_checkpoint(inst, 2, "register buffers");
+	if (ret)
+		goto err_bufs_free;
 	ret = session_register_bufs(inst);
 	if (ret)
 		goto err_bufs_free;
 
+	ret = stream_checkpoint(inst, 3, "clock and bandwidth scaling");
+	if (ret)
+		goto err_unreg_bufs;
 	venus_pm_load_scale(inst);
 
+	ret = stream_checkpoint(inst, 4, "load resources");
+	if (ret)
+		goto err_unreg_bufs;
 	ret = hfi_session_load_res(inst);
 	if (ret)
 		goto err_unreg_bufs;
 
+	ret = stream_checkpoint(inst, 5, "start firmware");
+	if (ret)
+		goto err_unload_res;
 	ret = hfi_session_start(inst);
 	if (ret)
 		goto err_unload_res;

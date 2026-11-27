@@ -94,6 +94,13 @@ struct venus_resources {
 	unsigned int vcodec_num;
 	const u32 dec_codec_blacklist;
 	const u32 enc_codec_blacklist;
+	/*
+	 * hand vcodec/CVP power domains to firmware hardware control across
+	 * fw boot; the fw requires them powered and clocked when it boots
+	 */
+	bool fw_ctrl_pds;
+	/* firmware has an internal CVP block and needs the DSP queue programmed */
+	bool dsp_ifaceq;
 	const char * const resets[VIDC_RESETS_NUM_MAX];
 	unsigned int resets_num;
 	enum hfi_version hfi_version;
@@ -174,6 +181,7 @@ struct venus_format {
  * @done:	a completion for sync HFI operations
  * @error:	an error returned during last HFI sync operations
  * @sys_error:	an error flag that signal system error event
+ * @sys_err_retries: consecutive failed sys_error recovery attempts
  * @sys_err_done: a waitqueue to wait for system error recovery end
  * @core_ops:	the core operations
  * @pm_ops:	a pointer to pm operations
@@ -236,6 +244,7 @@ struct venus_core {
 	struct completion done;
 	unsigned int error;
 	unsigned long sys_error;
+	unsigned int sys_err_retries;
 	wait_queue_head_t sys_err_done;
 	const struct hfi_core_ops *core_ops;
 	const struct venus_pm_ops *pm_ops;

@@ -280,6 +280,17 @@ int hfi_session_start(struct venus_inst *inst)
 	if (inst->state != INST_LOAD_RESOURCES)
 		return -EINVAL;
 
+	/* SM7150 firmware start hard-hangs this unit. Fail closed until the
+	 * CVP/firmware contract is implemented and validated; node registration
+	 * and successful resource loading do not establish encode support.
+	 */
+	if (inst->core->res->dsp_ifaceq &&
+	    inst->session_type == VIDC_SESSION_TYPE_ENC) {
+		dev_err(inst->core->dev,
+			"SM7150 encoding disabled: firmware-start hang is unresolved\n");
+		return -EOPNOTSUPP;
+	}
+
 	reinit_completion(&inst->done);
 
 	ret = ops->session_start(inst);

@@ -202,8 +202,8 @@ static int parse_codecs(struct venus_core *core, void *data)
 {
 	struct hfi_codec_supported *codecs = data;
 
-	core->dec_codecs = codecs->dec_codecs;
-	core->enc_codecs = codecs->enc_codecs;
+	core->dec_codecs = codecs->dec_codecs & ~core->res->dec_codec_blacklist;
+	core->enc_codecs = codecs->enc_codecs & ~core->res->enc_codec_blacklist;
 
 	if (core->res->dec_codec_blacklist)
 		core->dec_codecs &= ~core->res->dec_codec_blacklist;
@@ -277,6 +277,9 @@ static int hfi_platform_parser(struct venus_core *core, struct venus_inst *inst)
 
 	if (plat->codecs)
 		plat->codecs(core, &enc_codecs, &dec_codecs, &count);
+
+	dec_codecs &= ~core->res->dec_codec_blacklist;
+	enc_codecs &= ~core->res->enc_codec_blacklist;
 
 	if (plat->capabilities)
 		caps = plat->capabilities(core, &entries);

@@ -4,6 +4,7 @@
  * Copyright (C) 2017 Linaro Ltd.
  */
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -22,6 +23,20 @@
 #include "pm_helpers.h"
 
 #define NUM_B_FRAMES_MAX	4
+
+/* Temporary SM7150 bring-up tracing; disabled for normal operation. */
+static bool diagnostic_trace;
+module_param(diagnostic_trace, bool, 0600);
+MODULE_PARM_DESC(diagnostic_trace, "Log and pace encoder startup checkpoints");
+static void venc_checkpoint(struct venus_inst *inst, const char *stage)
+{
+ if (!diagnostic_trace || !inst->core->res->dsp_ifaceq)
+  return;
+ dev_info(inst->core->dev, "encode checkpoint: %s\n", stage);
+ /* Allow remote log delivery before the next hardware transaction. */
+ msleep(250);
+}
+
 
 /*
  * Three resons to keep MPLANE formats (despite that the number of planes
@@ -607,7 +622,9 @@ static int venc_pm_get(struct venus_inst *inst)
 	int ret;
 
 	mutex_lock(&core->pm_lock);
+	venc_checkpoint(inst, "runtime resume");
 	ret = pm_runtime_resume_and_get(dev);
+	venc_checkpoint(inst, "runtime resumed");
 	mutex_unlock(&core->pm_lock);
 
 	return ret < 0 ? ret : 0;
@@ -640,7 +657,9 @@ static int venc_pm_get_put(struct venus_inst *inst)
 	mutex_lock(&core->pm_lock);
 
 	if (pm_runtime_suspended(dev)) {
+		venc_checkpoint(inst, "runtime resume");
 		ret = pm_runtime_resume_and_get(dev);
+		venc_checkpoint(inst, "runtime resumed");
 		if (ret < 0)
 			goto error;
 
@@ -1267,31 +1286,38 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	inst->sequence_cap = 0;
 	inst->sequence_out = 0;
 
+	venc_checkpoint(inst, "power get");
 	ret = venc_pm_get(inst);
 	if (ret)
 		goto error;
 
+	venc_checkpoint(inst, "acquire core");
 	ret = venus_pm_acquire_core(inst);
 	if (ret)
 		goto put_power;
 
+	venc_checkpoint(inst, "power autosuspend");
 	ret = venc_pm_put(inst, true);
 	if (ret)
 		goto error;
 
+	venc_checkpoint(inst, "set properties");
 	ret = venc_set_properties(inst);
 	if (ret)
 		goto error;
 
+	venc_checkpoint(inst, "verify configuration");
 	ret = venc_verify_conf(inst);
 	if (ret)
 		goto error;
 
+	venc_checkpoint(inst, "set buffer counts");
 	ret = venus_helper_set_num_bufs(inst, inst->num_input_bufs,
 					inst->num_output_bufs, 0);
 	if (ret)
 		goto error;
 
+	venc_checkpoint(inst, "start firmware stream");
 	ret = venus_helper_vb2_start_streaming(inst);
 	if (ret)
 		goto error;
