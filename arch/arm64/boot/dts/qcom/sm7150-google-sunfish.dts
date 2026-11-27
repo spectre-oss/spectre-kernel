@@ -8,10 +8,18 @@
 
 #include <dt-bindings/firmware/qcom,scm.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/usb/pd.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6voice.h>
+#include <dt-bindings/clock/qcom,lpasscorecc-sc7180.h>
+#include <dt-bindings/clock/qcom,sm7150-camcc.h>
+#include <dt-bindings/media/video-interfaces.h>
 
 #include "sm7150.dtsi"
 #include "pm6150.dtsi"
@@ -58,8 +66,30 @@
 		};
 	};
 
+	camera_ldo: camera-ldo-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_ldo";
+		regulator-min-microvolt = <2850000>;
+		regulator-max-microvolt = <2850000>;
+		regulator-always-on;
+		enable-active-high;
+		gpio = <&pm6150l_gpios 12 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&camera_rear_vcm_en>;
+	};
+
+	cam_scan: cam-scan {
+		compatible = "google,sunfish-cam-scan";
+		status = "disabled";
+		clocks = <&camcc CAMCC_MCLK0_CLK>,
+			 <&camcc CAMCC_MCLK2_CLK>;
+		clock-names = "mclk0", "mclk2";
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+	};
+
 	gpio_keys: gpio-keys {
-		compatible = "gpio-keys";
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
 
 		pinctrl-0 = <&vol_up_n>;
 		pinctrl-names = "default";
@@ -68,10 +98,113 @@
 			label = "Volume Up";
 			gpios = <&pm6150l_gpios 2 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_VOLUMEUP>;
+			linux,input-type = <1>;
 			debounce-interval = <15>;
-			linux,can-disable;
-			wakeup-source;
 		};
+	};
+
+	/*
+	 * Probe snd-soc-cs35l41-i2c + snd-soc-sm8250 *after* Phosh
+	 * (blacklist at boot). Always-on pinctrl on these GPIOs hung splash.
+	 */
+	sound {
+		compatible = "qcom,sm8250-sndcard";
+		model = "Google Pixel 4a";
+		/* LPI @62b40000 ioremap hung USB. Do not bind card to that
+		 * pinctrl until a non-abort map exists. Pins stay in DT unused.
+		 */
+		/* Same CLOCK_SET 0x202 as DAI set_sysclk. Rate 12.288 not
+		 * q6afe-clocks default 19.2. lpasscc / GCC 0x47018 stay off. */
+		clocks = <&q6afecc LPASS_CLK_ID_SEC_TDM_IBIT 4>,
+			 <&q6afecc LPASS_CLK_ID_TER_TDM_IBIT 4>;
+		clock-names = "lpaif-sec-ibit", "lpaif-ter-ibit";
+		/* TLMM ter_mi2s (gpio 53–56). sleep/active like SEC LPI + sm8250.c. */
+		pinctrl-0 = <&ter_tdm_sleep>;
+		pinctrl-1 = <&ter_tdm_active>;
+		pinctrl-names = "sleep", "active";
+
+		mm1-dai-link {
+			link-name = "MultiMedia1";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+			};
+		};
+
+
+		/* Capture FE. MM1 is speaker playback; ADM COPP fights if shared. */
+		mm2-dai-link {
+			link-name = "MultiMedia2";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+			};
+		};
+
+		voicemmode1-dai-link {
+			link-name = "VoiceMMode1";
+			cpu {
+				sound-dai = <&sunfish_q6voicedai VOICEMMODE1>;
+			};
+		};
+
+		/*
+		 * Stock AFE START 0x9011 (SEC TDM TX_0 VI) then 0x9010
+		 * (RX_0). Mixer is this RX_0 link only; TX_0 is dai@41.
+		 * Not RX_1 (0x9012). LPI gpio 8–11, 12.288 MHz. CS35 slave.
+		 */
+		tdm-dai-link {
+			link-name = "TDM Playback";
+			cpu {
+				sound-dai = <&q6afedai SECONDARY_TDM_RX_0>;
+			};
+
+			platform {
+				sound-dai = <&q6routing>;
+			};
+
+			codec {
+				sound-dai = <&cs35l41_l 0>, <&cs35l41_r 0>;
+			};
+		};
+
+		/*
+		 * Builtin DMICs: rt5514 on TLMM 53–56, TERT TDM TX. Not WCD.
+		 * Needs snd-soc-rt5514.ko on the rootfs (modules_install of this
+		 * tree), otherwise the whole card defers on "codec dai not found".
+		 */
+		mic-dai-link {
+			link-name = "TDM Capture";
+			cpu {
+				sound-dai = <&q6afedai TERTIARY_TDM_TX_0>;
+			};
+
+			platform {
+				sound-dai = <&q6routing>;
+			};
+
+			codec {
+				sound-dai = <&codec>;
+			};
+		};
+	};
+
+	/*
+	 * Hold FTS reset/switch/AVDD mux after stmfts unbinds.
+	 * gpio-hog on these pins rebooted the board (T8b).
+	 */
+	touch_pinhold: regulator-touch-pinhold {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_pinhold";
+		regulator-always-on;
+		pinctrl-0 = <&touch_reset_n>, <&touch_switch_ap>, <&touch_avdd_en>;
+		pinctrl-names = "default";
+	};
+
+	/* Root-triggered lab only: firmware is not loaded during boot. */
+	sunfish-fpc {
+		compatible = "google,sunfish-fpc-lab";
+		memory-region = <&qseecom_mem>;
+		reset-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		irq-gpios = <&tlmm 90 GPIO_ACTIVE_HIGH>;
 	};
 
 	reserved-memory {
@@ -181,6 +314,42 @@
 
 		regulator-always-on;
 		vin-supply = <&vph_pwr>;
+	};
+
+	/*
+	 * Dummy supplies for st,stmfts (required by the binding).
+	 * Do not share panel L13A: if probe fails, stmfts disables vdd
+	 * and would blank the OLED. Stock DT left real vdd/avdd commented;
+	 * AVDD is GPIO4 (touch_avdd_en pinctrl keeps it high).
+	 */
+	touch_vdd: regulator-touch-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_vdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	touch_avdd: regulator-touch-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "touch_avdd";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	/*
+	 * Pixel 4a pack ~3080 mAh (Google DT google,chg-battery-capacity).
+	 * Without this, Phosh has no fuel-gauge capacity (wiki: battery
+	 * charging may work, level reporting does not).
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		device-chemistry = "lithium-ion-polymer";
+		constant-charge-current-max-microamp = <1500000>;
+		voltage-min-design-microvolt = <3400000>;
+		voltage-max-design-microvolt = <4400000>;
+		charge-full-design-microamp-hours = <3080000>;
 	};
 };
 
@@ -517,10 +686,122 @@
 
 &cci0 {
 	status = "okay";
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&cci0_default &cci1_default
+		     &cam_mclk0_default &cam_mclk2_default
+		     &cam_rst_rear_default &cam_rst_front_default>;
+	pinctrl-1 = <&cci0_sleep &cci1_sleep>;
+};
+
+&cci0_i2c0 {
+	clock-frequency = <400000>;
+
+	lc898123_ois: ois@3e {
+		compatible = "onsemi,lc898123f40";
+		reg = <0x3e>;
+		vcc-supply = <&camera_ldo>;
+	};
+
+	lc898219_vcm: lens@73 {
+		compatible = "onsemi,lc898219";
+		reg = <0x73>;
+		vcc-supply = <&camera_ldo>;
+	};
+
+	imx363_rear: camera@1a {
+		compatible = "sony,imx363";
+		reg = <0x1a>;
+
+		lens-focus = <&lc898219_vcm>;
+		ois = <&lc898123_ois>;
+
+		clocks = <&camcc CAMCC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAMCC_MCLK0_CLK>;
+		assigned-clock-rates = <24000000>;
+		clock-frequency = <24000000>;
+
+		reset-gpios = <&tlmm 43 GPIO_ACTIVE_LOW>;
+
+		vana-supply = <&slg51000_ldo3>;
+		vdig-supply = <&slg51000_ldo1>;
+		vif-supply = <&slg51000_ldo7>;
+
+		rotation = <90>;
+		orientation = <1>;
+
+		port {
+			imx363_rear_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <636000000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&cci0_i2c1 {
+	imx355_eeprom: eeprom@51 {
+		compatible = "atmel,24c64";
+		reg = <0x51>;
+		pagesize = <32>;
+		read-only;
+	};
+
+	imx355_front: camera@1a {
+		compatible = "sony,imx355";
+		reg = <0x1a>;
+
+		clocks = <&camcc CAMCC_MCLK2_CLK>;
+		assigned-clocks = <&camcc CAMCC_MCLK2_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 68 GPIO_ACTIVE_LOW>;
+
+		avdd-supply = <&slg51000_ldo2>;
+		dvdd-supply = <&slg51000_ldo5>;
+		dovdd-supply = <&slg51000_ldo7>;
+
+		rotation = <270>;
+		orientation = <0>;
+
+		port {
+			imx355_front_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <360000000>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
 };
 
 &cci1 {
 	status = "okay";
+};
+
+&camss {
+	vdda-phy-supply = <&vreg_l3c_1p23>;
+	vdda-pll-supply = <&vreg_l3c_1p23>;
+	status = "okay";
+
+	ports {
+		port@0 {
+			reg = <0>;
+
+			csiphy0_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx363_rear_ep>;
+			};
+		};
+
+		port@2 {
+			reg = <2>;
+
+			csiphy2_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				remote-endpoint = <&imx355_front_ep>;
+			};
+		};
+	};
 };
 
 &dispcc {
@@ -550,14 +831,44 @@
 	codec: rt5514@57 {
 		compatible = "realtek,rt5514";
 		reg = <0x57>;
+		#sound-dai-cells = <0>;
+		realtek,dmic-init-delay-ms = <50>;
 	};
 };
 
+/*
+ * LSM6DSR accel+gyro is **not** on an AP QUP.
+ * SEE s5_lsm6dsr.json: SSC I3C inst 1, slave 0x6A, i3c_dyn 10, DRI 86.
+ * Live 2026-08-25: i2cget WHO_AM_I @0x6A failed on i2c-2/7/9/12/13/14.
+ * 7.1 has no qcom,geni-i3c master. Modules: st_lsm6dsx / st_lsm6dsx_i2c.
+ * Do not instantiate st,lsm6dsr here while ADSP owns the bus.
+ */
+
 &i2c7 {
 	status = "okay";
+	/* Android used 1 MHz on this QUP; 400 kHz added ~6ms per 256-byte FIFO. */
 	clock-frequency = <1000000>;
 
-	/* st,fts touchscreen@49 */
+	/* ST FTM5/FTS5, I2C 0x49. Switch low = AP (stock st,switch_gpio). */
+	touchscreen@49 {
+		compatible = "st,stmfts5";
+		reg = <0x49>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <9 IRQ_TYPE_LEVEL_LOW>;
+
+		reset-gpios = <&tlmm 8 GPIO_ACTIVE_LOW>;
+		mode-switch-gpios = <&tlmm 72 GPIO_ACTIVE_LOW>;
+
+		vdd-supply = <&touch_vdd>;
+		avdd-supply = <&touch_avdd>;
+
+		pinctrl-0 = <&touch_irq_n>, <&touch_reset_n>, <&touch_switch_ap>;
+		pinctrl-names = "default";
+
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2340>;
+	};
 };
 
 &i2c9 {
@@ -565,8 +876,52 @@
 	clock-frequency = <400000>;
 
 	/* microchip,pac1934 power-monitor@10 */
-	/* cirrus,cs35l41 speaker-amp@40 */
-	/* cirrus,cs35l41 speaker-amp@41 */
+
+	cs35l41_l: speaker-amp@40 {
+		compatible = "cirrus,cs35l41";
+		reg = <0x40>;
+		#sound-dai-cells = <1>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <64 IRQ_TYPE_LEVEL_HIGH>;
+		reset-gpios = <&pm6150l_gpios 8 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&amp_rst_l>, <&amp_irq_l>;
+		pinctrl-names = "default";
+
+		VA-supply = <&vreg_l11a_1p8>;
+		VP-supply = <&vreg_bob>;
+
+		cirrus,boost-peak-milliamp = <3700>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <15>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <5>;
+		cirrus,gpio2-output-enable;
+		sound-name-prefix = "L";
+	};
+
+	cs35l41_r: speaker-amp@41 {
+		compatible = "cirrus,cs35l41";
+		reg = <0x41>;
+		#sound-dai-cells = <1>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <65 IRQ_TYPE_LEVEL_HIGH>;
+		reset-gpios = <&pm6150l_gpios 11 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&amp_rst_r>, <&amp_irq_r>;
+		pinctrl-names = "default";
+
+		VA-supply = <&vreg_l11a_1p8>;
+		VP-supply = <&vreg_bob>;
+
+		cirrus,boost-peak-milliamp = <3700>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <15>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <5>;
+		cirrus,gpio2-output-enable;
+		sound-name-prefix = "R";
+	};
 
 	/*
 	typec-mux@43 {
@@ -590,7 +945,66 @@
 
 	/* st,m24c08 e2prom@50 */
 	/* ti,drv2624 haptic@5a */
-	/* dlg,slg51000 pmic@75*/
+
+	slg51000: pmic@75 {
+		compatible = "dlg,slg51000";
+		reg = <0x75>;
+		dlg,cs-gpios = <&pm6150l_gpios 4 GPIO_ACTIVE_HIGH>,
+			       <&pm6150l_gpios 6 GPIO_ACTIVE_HIGH>;
+		dlg,enable-gpios = <&pm6150l_gpios 1 GPIO_ACTIVE_HIGH>,
+				   <&pm6150l_gpios 5 GPIO_ACTIVE_HIGH>;
+
+		regulators {
+			slg51000_ldo1: ldo1 {
+				regulator-name = "slg51000_ldo1";
+				regulator-min-microvolt = <2850000>;
+				regulator-max-microvolt = <2850000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo2: ldo2 {
+				regulator-name = "slg51000_ldo2";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo3: ldo3 {
+				regulator-name = "slg51000_ldo3";
+				regulator-min-microvolt = <2850000>;
+				regulator-max-microvolt = <2850000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo4: ldo4 {
+				regulator-name = "slg51000_ldo4";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo5: ldo5 {
+				regulator-name = "slg51000_ldo5";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo6: ldo6 {
+				regulator-name = "slg51000_ldo6";
+				regulator-min-microvolt = <1050000>;
+				regulator-max-microvolt = <1050000>;
+				regulator-always-on;
+			};
+
+			slg51000_ldo7: ldo7 {
+				regulator-name = "slg51000_ldo7";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-always-on;
+			};
+		};
+	};
 };
 
 &ipa {
@@ -642,6 +1056,16 @@
 	status = "okay";
 };
 
+&pm6150_charger {
+	monitored-battery = <&battery>;
+	status = "okay";
+};
+
+&pm6150_qgauge {
+	monitored-battery = <&battery>;
+	status = "okay";
+};
+
 &pm6150_resin {
 	linux,code = <KEY_VOLUMEDOWN>;
 	status = "okay";
@@ -659,12 +1083,23 @@
 	connector {
 		compatible = "usb-c-connector";
 
-		power-role = "source";
+		/*
+		 * data-role=device + no usb-role-switch made
+		 * qcom,pmic-typec probe fail -22 (no /sys/class/typec,
+		 * usb0 NO-CARRIER even with UDC bound). Restore dual +
+		 * role-switch; gadget is still configfs NCM.
+		 */
+		power-role = "dual";
 		data-role = "dual";
+		try-power-role = "sink";
+		try-data-role = "device";
 		self-powered;
 
 		source-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE |
 			       PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)>;
+		sink-pdos = <PDO_FIXED(5000, 500, PDO_FIXED_DUAL_ROLE |
+			     PDO_FIXED_USB_COMM)>;
+		op-sink-microwatt = <2500000>;
 
 		ports {
 			#address-cells = <1>;
@@ -716,6 +1151,17 @@
 	};
 };
 
+&pm6150_gpios {
+	touch_avdd_en: touch-avdd-en-state {
+		pins = "gpio4";
+		function = "normal";
+		qcom,drive-strength = <2>;
+		bias-disable;
+		output-high;
+		power-source = <1>;
+	};
+};
+
 &pm6150l_gpios {
 	vol_up_n: vol-up-n-state {
 		pins = "gpio2";
@@ -732,6 +1178,36 @@
 		bias-disable;
 		output-low;
 		power-source = <1>;
+	};
+
+	amp_rst_l: amp-rst-l-state {
+		pins = "gpio8";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		qcom,drive-strength = <2>;
+		bias-disable;
+		output-high;
+		input-disable;
+		power-source = <1>;
+	};
+
+	amp_rst_r: amp-rst-r-state {
+		pins = "gpio11";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		qcom,drive-strength = <2>;
+		bias-disable;
+		output-high;
+		input-disable;
+		power-source = <1>;
+	};
+
+	camera_rear_vcm_en: camera-rear-vcm-en-state {
+		pins = "gpio12";
+		function = PMIC_GPIO_FUNC_NORMAL;
+		qcom,drive-strength = <2>;
+		bias-disable;
+		output-high;
+		input-disable;
+		power-source = <0>;
 	};
 };
 
@@ -775,8 +1251,155 @@
 	status = "okay";
 };
 
+/* sm7150.dtsi has q6asm dais with no children → probe -EINVAL "No dais found in DT" */
+&q6asmdai {
+	dai@0 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+	};
+
+	dai@1 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>;
+	};
+};
+
+&q6afedai {
+	/* Stock 0x9011 = SECONDARY_TDM_TX_0 (VI, acdb 512). Started first. */
+	dai@41 {
+		reg = <SECONDARY_TDM_TX_0>;
+		qcom,tdm-sync-mode = <0>;
+		qcom,tdm-sync-src = <1>;
+		qcom,tdm-data-out = <0>;
+		qcom,tdm-invert-sync = <0>;
+		qcom,tdm-data-delay = <0>;
+		qcom,tdm-data-align = <0>;
+	};
+
+	dai@40 {
+		reg = <SECONDARY_TDM_RX_0>;
+		qcom,tdm-sync-mode = <0>;
+		qcom,tdm-sync-src = <1>;
+		/* AFE RX = SoC drives SD/SCK. 0 left PCM_CTL data OE off. */
+		qcom,tdm-data-out = <1>;
+		qcom,tdm-invert-sync = <0>;
+		qcom,tdm-data-delay = <0>;
+		qcom,tdm-data-align = <0>;
+	};
+
+	/*
+	 * rt5514 builtin DMICs. Stock FDT qcom,msm-dai-tdm-tert-tx (read on
+	 * 2026-09-02 while the Recorder app captured): clk 12288000 internal,
+	 * sync-mode 0, sync-src 1, data-out 0, invert-sync 0, data-delay 1,
+	 * data-align 0. Stock mixer: TERT_TDM_TX_0 1ch S16, channel offsets
+	 * 0/8/12, rt5514 "Stereo1 DMIC Mux"=DMIC1 + "Sto1 ADC MIXL DMIC Switch".
+	 */
+	dai@57 {
+		reg = <TERTIARY_TDM_TX_0>;
+		qcom,tdm-sync-mode = <0>;
+		qcom,tdm-sync-src = <1>;
+		qcom,tdm-data-out = <0>;
+		qcom,tdm-invert-sync = <0>;
+		qcom,tdm-data-delay = <1>;
+		qcom,tdm-data-align = <0>;
+	};
+};
+
+/*
+ * Speaker ASP is LPI gpio 8–11 at 0x62b40000 (AOSP sec_mi2s). Probe defers until
+ * q6afecc exists (load q6afe-clocks after ADSP start). Not at splash:
+ * CS35 stays blacklisted. DCODEC island vote is the sound card
+ * "audio" clock, not lpass_tlmm (that hung splash).
+ */
+/* lpasscc/lpass_hm stay disabled: probe of 0x62d00000 rebooted this unit.
+ * Builtin LPI ioremap of 0x62b40000 bootlooped (2026-08-27). Driver is
+ * =m and blacklisted at splash. Late-play modprobe after SSH+MACRO.
+ */
+&lpass_tlmm {
+	status = "okay";
+
+	/* AOSP sleep keeps mux (func3/3/4/2); only drive/pull/OE change. */
+	sec_tdm_sleep: sec-tdm-sleep-state {
+		sck-pins {
+			pins = "gpio8";
+			function = "sec_mi2s_sclk";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		ws-pins {
+			pins = "gpio9";
+			function = "sec_mi2s_ws";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		sd0-pins {
+			pins = "gpio10";
+			function = "sec_mi2s_data";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		sd1-pins {
+			pins = "gpio11";
+			function = "dmic2_data";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+	};
+
+	sec_tdm_active: sec-tdm-active-state {
+		sck-pins {
+			pins = "gpio8";
+			function = "sec_mi2s_sclk";
+			drive-strength = <8>;
+			bias-disable;
+			output-high;
+		};
+
+		ws-pins {
+			pins = "gpio9";
+			function = "sec_mi2s_ws";
+			drive-strength = <8>;
+			bias-disable;
+			output-high;
+		};
+
+		sd0-pins {
+			pins = "gpio10";
+			function = "sec_mi2s_data";
+			drive-strength = <8>;
+			bias-disable;
+			output-high;
+		};
+
+		/* AOSP func2 == mux 2, named dmic2_data in the SoC driver */
+		sd1-pins {
+			pins = "gpio11";
+			function = "dmic2_data";
+			drive-strength = <8>;
+			bias-disable;
+			output-high;
+		};
+	};
+};
+
+/*
+ * Keep ADSP FastRPC. CHRE SAR (sensor_process / sar.cc) starts from
+ * rcinit either way; without /dev/fastrpc-adsp, hexagonrpcd cannot
+ * serve sunfish hexagonfs (registry + chre_drv_*.so) and findSuidSync
+ * fatals the whole DSP after ~10s. Audio is still APR (q6afe/q6asm).
+ * hexagonrpcd -R /usr/share/qcom/sm7150/Google/sunfish
+ */
+
 &remoteproc_adsp {
 	firmware-name = "qcom/sm7150/google/sunfish/adsp.mbn";
+	/* Do not auto-boot: CS35 at splash hung the panel. Start after Phosh
+	 * (echo start) and play in the ~10s window before SAR. */
+	qcom,manual-boot;
 	status = "okay";
 };
 
@@ -787,13 +1410,56 @@
 
 &remoteproc_mpss {
 	firmware-name = "qcom/sm7150/google/sunfish/modem.mbn";
+	/*
+	 * Stock Google modemsmem driver: SMEM item 134 (VENDOR0) carries the
+	 * RF SKU (cdt_hwid major/minor/platform/subtype). Without it the
+	 * modem reports no bands and DMS online fails with QMI 52.
+	 */
+	google,modem-smem;
+	/*
+	 * Stock DTB has no AP qlink/wmss pinctrl — MPSS DAL owns those
+	 * pads. AP claim of gpio85 as output-high blocked "Pull down
+	 * WMSS RESET". Keep RF/MSS clock votes. Pins are reserved on
+	 * &tlmm so Linux does not re-init them.
+	 */
+	clocks = <&rpmhcc RPMH_CXO_CLK>,
+		 <&gcc GCC_RX3_QLINK_CLKREF_CLK>,
+		 <&rpmhcc RPMH_RF_CLK1>,
+		 <&rpmhcc RPMH_RF_CLK2>,
+		 <&rpmhcc RPMH_RF_CLK1_A>,
+		 <&rpmhcc RPMH_RF_CLK2_A>,
+		 <&gcc GCC_MSS_CFG_AHB_CLK>,
+		 <&gcc GCC_MSS_SNOC_AXI_CLK>,
+		 <&gcc GCC_MSS_Q6_MEMNOC_AXI_CLK>,
+		 <&gcc GCC_MSS_NAV_AXI_CLK>,
+		 <&gcc GCC_MSS_MFAB_AXIS_CLK>;
+	clock-names = "xo", "aggre2", "rfclk1", "rfclk2",
+		      "rfclk1_ao", "rfclk2_ao",
+		      "iface", "snoc_axi", "mnoc_axi", "nav", "mfab";
+	/*
+	 * Stock pil-modem msm-bus: MSM_BUS_MASTER_LLCC (0x81) →
+	 * MSM_BUS_SLAVE_EBI_CH0 (0x200), ib 0x6acfc0 KBps during proxy.
+	 * qcom_q6v5_prepare() already icc_set_bw(UINT_MAX) if this path
+	 * exists. Not the scm CRYPTO path (0x7d).
+	 */
+	interconnects = <&mc_virt MASTER_LLCC QCOM_ICC_TAG_ALWAYS
+			 &mc_virt SLAVE_EBI_CH0 QCOM_ICC_TAG_ALWAYS>;
 	status = "okay";
 };
 
 &spi0 {
 	status = "okay";
 
-	/* realtek,rt5514 codec@0 */
+	/*
+	 * rt5514p DSP firmware upload path (stock: rt5514 spi0.0). The
+	 * codec itself is the I2C2 node; rt5514-spi only provides
+	 * rt5514_spi_burst_write() for the 4 vendor firmware blobs.
+	 */
+	rt5514_spi: codec@0 {
+		compatible = "realtek,rt5514";
+		reg = <0>;
+		spi-max-frequency = <5000000>;
+	};
 };
 
 &spi1 {
@@ -804,7 +1470,175 @@
 };
 
 &tlmm {
+	/*
+	 * 59–62 only. 85/96–97/108–109 are no longer reserved so
+	 * /sys/kernel/debug/gpio prints the silicon QLink pads after
+	 * MPSS cold start (docs/plan/radio.md card C1). Nothing on the
+	 * AP claims them; mpss has no pinctrl-0.
+	 */
 	gpio-reserved-ranges = <59 4>;
+
+	cam_mclk0_default: cam-mclk0-default-state {
+		pins = "gpio13";
+		function = "cam_mclk";
+		drive-strength = <4>;
+		bias-disable;
+	};
+
+	cam_mclk2_default: cam-mclk2-default-state {
+		pins = "gpio15";
+		function = "cam_mclk";
+		drive-strength = <4>;
+		bias-disable;
+	};
+
+	cam_front_default: cam-front-default-state {
+		mclk-pins {
+			pins = "gpio15";
+			function = "cam_mclk";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		reset-pins {
+			pins = "gpio68";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	cam_rst_rear_default: cam-rst-rear-default-state {
+		pins = "gpio43";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	cam_rst_front_default: cam-rst-front-default-state {
+		pins = "gpio68";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	/* rt5514 TERT TDM: 53 SCK 54 WS out, 55/56 SD in. */
+	ter_tdm_sleep: ter-tdm-sleep-state {
+		mux-pins {
+			pins = "gpio53", "gpio54", "gpio55", "gpio56";
+			function = "ter_mi2s";
+		};
+
+		clk-pins {
+			pins = "gpio53", "gpio54";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		data-pins {
+			pins = "gpio55", "gpio56";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+	};
+
+	ter_tdm_active: ter-tdm-active-state {
+		mux-pins {
+			pins = "gpio53", "gpio54", "gpio55", "gpio56";
+			function = "ter_mi2s";
+		};
+
+		clk-pins {
+			pins = "gpio53", "gpio54";
+			drive-strength = <8>;
+			bias-disable;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio55", "gpio56";
+			input-enable;
+			bias-disable;
+		};
+	};
+
+	/* QLink / MSS LTE to WTR. debugfs pinmux-select did not claim. */
+	qlink_request_pins: qlink-request-state {
+		pins = "gpio96";
+		function = "qlink_request";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+
+	qlink_enable_pins: qlink-enable-state {
+		pins = "gpio97";
+		function = "qlink_enable";
+		drive-strength = <8>;
+		bias-disable;
+		output-enable;
+	};
+
+	/* modem.b16 DAL: wmss_reset after UIM gpio75–82 → gpio85. */
+	wmss_reset_pins: wmss-reset-state {
+		pins = "gpio85";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	mss_lte_pins: mss-lte-state {
+		pins = "gpio108", "gpio109";
+		function = "mss_lte";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	touch_irq_n: touch-irq-n-state {
+		pins = "gpio9";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+
+	touch_reset_n: touch-reset-n-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	/* Low: AP owns the FTS bus; high would hand the chip to SLPI */
+	touch_switch_ap: touch-switch-ap-state {
+		pins = "gpio72";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	amp_irq_l: amp-irq-l-state {
+		pins = "gpio64";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
+
+	amp_irq_r: amp-irq-r-state {
+		pins = "gpio65";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		input-enable;
+	};
 
 	mdp_vsync_p: mdp-vsync-p-state {
 		pins = "gpio10";
@@ -859,6 +1693,12 @@
 		vddrf-supply = <&vdd_wcss_adc_dac>;
 		vddch0-supply = <&vreg_l10c_3p3>;
 		max-speed = <3200000>;
+		/*
+		 * Same WCN3990 die as Wi-Fi. HCI down used to send a 2400
+		 * baud power-off pulse and drop vddio; that takes ath10k
+		 * with it and hard-resets the SoC. Keep the combo powered.
+		 */
+		qcom,keep-power;
 	};
 };
 
@@ -889,6 +1729,7 @@
 &usb_1_dwc3 {
 	dr_mode = "otg";
 	usb-role-switch;
+	role-switch-default-mode = "peripheral";
 };
 
 &usb_1_dwc3_hs {
@@ -923,4 +1764,29 @@
 	qcom,ath10k-calibration-variant = "google_sunfish";
 
 	status = "okay";
+};
+
+/* Cellular voice uses the same TERT TX microphone and SEC RX speaker BEs. */
+&remoteproc_adsp_glink {
+	apr {
+		service@9 {
+			compatible = "qcom,q6mvm";
+			reg = <APR_SVC_ADSP_MVM>;
+			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+			sunfish_q6voicedai: dais {
+				compatible = "qcom,q6voice-dais";
+				#sound-dai-cells = <1>;
+			};
+		};
+		service@a {
+			compatible = "qcom,q6cvs";
+			reg = <APR_SVC_ADSP_CVS>;
+			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+		};
+		service@b {
+			compatible = "qcom,q6cvp";
+			reg = <APR_SVC_ADSP_CVP>;
+			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+		};
+	};
 };

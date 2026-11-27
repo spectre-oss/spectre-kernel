@@ -157,6 +157,13 @@
 #define GCC_VS_CTRL_CLK					145
 #define GCC_VS_CTRL_CLK_SRC				146
 #define GCC_VSENSOR_CLK_SRC				147
+#define GCC_LPASS_CFG_NOC_SWAY_CLK			148
+#define GCC_RX3_QLINK_CLKREF_CLK			149
+#define GCC_MSS_CFG_AHB_CLK				150
+#define GCC_MSS_MFAB_AXIS_CLK				151
+#define GCC_MSS_NAV_AXI_CLK				152
+#define GCC_MSS_SNOC_AXI_CLK				153
+#define GCC_MSS_Q6_MEMNOC_AXI_CLK			154
 
 /* GCC Resets */
 #define GCC_PCIE_0_BCR					0

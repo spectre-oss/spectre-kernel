@@ -11,6 +11,7 @@
 #include <dt-bindings/clock/qcom,sm7150-camcc.h>
 #include <dt-bindings/clock/qcom,sm7150-dispcc.h>
 #include <dt-bindings/clock/qcom,sm7150-gcc.h>
+#include <dt-bindings/clock/qcom,lpasscorecc-sc7180.h>
 #include <dt-bindings/clock/qcom,sm7150-videocc.h>
 #include <dt-bindings/dma/qcom-gpi.h>
 #include <dt-bindings/interconnect/qcom,icc.h>
@@ -4664,35 +4665,67 @@
 			status = "disabled";
 		};
 
-		lpass_tlmm: pinctrl@62b52000 {
-			compatible = "qcom,sm7150-lpass-lpi-pinctrl";
-			/* SSC range: <0 0x62b40000 0 0x12000> */
-			reg = <0 0x62b52000 0 0xe000>;
+		lpass_hm: clock-controller@63000000 {
+			compatible = "qcom,sm7150-lpasshm";
+			reg = <0 0x63000000 0 0x28>;
+			clocks = <&gcc GCC_LPASS_CFG_NOC_SWAY_CLK>,
+				 <&rpmhcc RPMH_CXO_CLK>;
+			clock-names = "iface", "bi_tcxo";
+			power-domains = <&rpmhpd RPMHPD_CX>;
+			#clock-cells = <1>;
+			#power-domain-cells = <1>;
+			status = "disabled";
+		};
 
-			clocks = <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
-			clock-names = "core";
+		lpasscc: clock-controller@62d00000 {
+			compatible = "qcom,sm7150-lpasscorecc";
+			reg = <0 0x62d00000 0 0x50000>,
+			      <0 0x62780000 0 0x30000>;
+			reg-names = "lpass_core_cc", "lpass_audio_cc";
+			clocks = <&gcc GCC_LPASS_CFG_NOC_SWAY_CLK>,
+				 <&rpmhcc RPMH_CXO_CLK>;
+			clock-names = "iface", "bi_tcxo";
+			power-domains = <&lpass_hm LPASS_CORE_HM_GDSCR>;
+			#clock-cells = <1>;
+			#power-domain-cells = <1>;
+			status = "disabled";
+		};
+
+		lpass_tlmm: pinctrl@62b40000 {
+			compatible = "qcom,sm7150-lpass-lpi-pinctrl";
+			/*
+			 * AOSP lpi_pinctrl@62b40000, 32 GPIOs, stride 0x1000.
+			 * gpio8 CFG is 0x62b48000 (CS35 SCK). The old window
+			 * @62b52000 made Linux gpio8 = AOSP gpio26.
+			 */
+			reg = <0 0x62b40000 0 0x20000>;
+
+			/* Stock play: lpass_hw_vote_clk=0. Do not attach MACRO
+			 * as this node's "core" (clk_enable hung splash + USB).
+			 * Bind this driver only after ADSP Power/Clock ready.
+			 */
 
 			gpio-controller;
 			#gpio-cells = <2>;
-			gpio-ranges = <&lpass_tlmm 0 0 14>;
+			gpio-ranges = <&lpass_tlmm 0 0 32>;
 
 			tx_swr_active: tx-swr-active-state {
 				clk-pins {
-					pins = "gpio0";
+					pins = "gpio18";
 					function = "swr_tx_clk";
 					drive-strength = <8>;
 					bias-bus-hold;
 				};
 
 				data1-pins {
-					pins = "gpio1";
+					pins = "gpio19";
 					function = "swr_tx_data";
 					drive-strength = <8>;
 					bias-bus-hold;
 				};
 
 				data2-pins {
-					pins = "gpio2";
+					pins = "gpio20";
 					function = "swr_tx_data";
 					drive-strength = <8>;
 					bias-bus-hold;
@@ -4701,21 +4734,21 @@
 
 			tx_swr_sleep: tx-swr-sleep-state {
 				clk-pins {
-					pins = "gpio0";
+					pins = "gpio18";
 					function = "swr_tx_clk";
 					drive-strength = <2>;
 					bias-bus-hold;
 				};
 
 				data1-pins {
-					pins = "gpio1";
+					pins = "gpio19";
 					function = "swr_tx_data";
 					drive-strength = <2>;
 					bias-bus-hold;
 				};
 
 				data2-pins {
-					pins = "gpio2";
+					pins = "gpio20";
 					function = "swr_tx_data";
 					drive-strength = <2>;
 					bias-bus-hold;
@@ -4724,14 +4757,14 @@
 
 			rx_swr_active: rx-swr-active-state {
 				clk-pins {
-					pins = "gpio3";
+					pins = "gpio21";
 					function = "swr_rx_clk";
 					drive-strength = <8>;
 					bias-bus-hold;
 				};
 
 				data-pins {
-					pins = "gpio4", "gpio5";
+					pins = "gpio22", "gpio23";
 					function = "swr_rx_data";
 					drive-strength = <8>;
 					bias-bus-hold;
@@ -4741,14 +4774,14 @@
 
 			rx_swr_sleep: rx-swr-sleep-state {
 				clk-pins {
-					pins = "gpio3";
+					pins = "gpio21";
 					function = "swr_rx_clk";
 					drive-strength = <2>;
 					bias-bus-hold;
 				};
 
 				data-pins {
-					pins = "gpio4", "gpio5";
+					pins = "gpio22", "gpio23";
 					function = "swr_rx_data";
 					drive-strength = <2>;
 					bias-bus-hold;
@@ -4756,14 +4789,14 @@
 			};
 
 			wcd9375_reset_active: wcd9375-reset-active-state {
-				pins = "gpio6";
+				pins = "gpio24";
 				function = "cdc_pdm_rx";
 				drive-strength = <16>;
 				output-high;
 			};
 
 			wcd9375_reset_sleep: wcd9375-reset-sleep-state {
-				pins = "gpio6";
+				pins = "gpio24";
 				function = "cdc_pdm_rx";
 				drive-strength = <16>;
 				bias-disable;
