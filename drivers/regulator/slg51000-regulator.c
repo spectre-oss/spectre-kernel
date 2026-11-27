@@ -41,6 +41,8 @@ struct slg51000 {
 	struct regulator_desc *rdesc[SLG51000_MAX_REGULATORS];
 	struct regulator_dev *rdev[SLG51000_MAX_REGULATORS];
 	struct gpio_desc *cs_gpiod;
+	struct gpio_desc *cam_buck_gpiod;
+	struct gpio_desc *ena_gpiod[2];
 	int chip_irq;
 };
 
@@ -439,22 +441,38 @@ static int slg51000_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct slg51000 *chip;
-	struct gpio_desc *cs_gpiod;
-	int error, ret;
+	struct gpio_desc *gpiod;
+	int error, ret, i;
 
 	chip = devm_kzalloc_obj(dev, struct slg51000);
 	if (!chip)
 		return -ENOMEM;
 
-	cs_gpiod = devm_gpiod_get_optional(dev, "dlg,cs",
-					   GPIOD_OUT_HIGH |
-						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
-	if (IS_ERR(cs_gpiod))
-		return PTR_ERR(cs_gpiod);
+	gpiod = devm_gpiod_get_index_optional(dev, "dlg,cs", 1,
+					     GPIOD_OUT_HIGH);
+	if (IS_ERR(gpiod))
+		return PTR_ERR(gpiod);
+	if (gpiod) {
+		chip->cam_buck_gpiod = gpiod;
+		usleep_range(5000, 6000);
+	}
 
-	if (cs_gpiod) {
-		dev_info(dev, "Found chip selector property\n");
-		chip->cs_gpiod = cs_gpiod;
+	gpiod = devm_gpiod_get_index_optional(dev, "dlg,cs", 0,
+					     GPIOD_OUT_HIGH |
+						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
+	if (IS_ERR(gpiod))
+		return PTR_ERR(gpiod);
+	if (gpiod) {
+		chip->cs_gpiod = gpiod;
+		usleep_range(2000, 3000);
+	}
+
+	for (i = 0; i < 2; i++) {
+		gpiod = devm_gpiod_get_index_optional(dev, "dlg,enable", i,
+						     GPIOD_OUT_LOW);
+		if (IS_ERR(gpiod))
+			return PTR_ERR(gpiod);
+		chip->ena_gpiod[i] = gpiod;
 	}
 
 	usleep_range(10000, 11000);

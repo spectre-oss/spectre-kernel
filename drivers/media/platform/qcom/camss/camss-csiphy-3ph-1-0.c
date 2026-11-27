@@ -1290,6 +1290,9 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
 	for (i = 0; i < c->num_data; i++)
 		val |= BIT(c->data[i].pos * 2);
 
+	dev_info(csiphy->camss->dev,
+		 "csiphy%d CTRL5=0x%x settle=%u\n", csiphy->id, val, settle_cnt);
+
 	writel_relaxed(val, csiphy->base +
 		       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 5));
 

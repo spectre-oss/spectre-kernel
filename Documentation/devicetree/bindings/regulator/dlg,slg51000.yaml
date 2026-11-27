@@ -21,9 +21,17 @@ properties:
     maxItems: 1
 
   dlg,cs-gpios:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
     description:
-      GPIO for chip select
+      Chip-select GPIO (index 0). Optional second GPIO (index 1) is the
+      camera buck enable; assert index 1 before index 0 (Pixel sunfish).
+
+  dlg,enable-gpios:
+    minItems: 1
+    maxItems: 2
+    description:
+      Optional enable GPIOs held low at probe (Pixel sunfish sequencing).
 
   vin3-supply:
     description:
