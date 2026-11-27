@@ -1178,7 +1178,7 @@ EXPORT_SYMBOL_GPL(snd_soc_dai_stream_active);
  */
 int snd_soc_dai_set_stream(struct snd_soc_dai *dai, void *stream, int direction)
 {
-	if (dai->driver->ops->set_stream)
+	if (dai->driver->ops && dai->driver->ops->set_stream)
 		return dai->driver->ops->set_stream(dai, stream, direction);
 	else
 		return -ENOTSUPP;

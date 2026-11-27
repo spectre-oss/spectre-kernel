@@ -397,6 +397,7 @@ struct q6afe {
 	wait_queue_head_t wait;
 	struct list_head port_list;
 	spinlock_t port_list_lock;
+	uint32_t lpass_hw_core_client_hdl[Q6AFE_LPASS_CORE_HW_VOTE_MAX];
 };
 
 struct afe_port_cmd_device_start {
@@ -1020,6 +1021,12 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 	case APR_BASIC_RSP_RESULT: {
 		res = data->payload;
 		if (res->status) {
+			// EOK = 0
+			// EFAILED = 1
+			// EBADPARAM = 2
+			// EUNSUPPORTED = 3
+			// EVERSION = 4
+			//
 			dev_err(afe->dev, "cmd = 0x%x returned error = 0x%x\n",
 				res->opcode, res->status);
 		}
@@ -1037,6 +1044,9 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 				afe->result = *res;
 				wake_up(&afe->wait);
 			}
+			break;
+		case AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST:
+			dev_err(afe->dev, "AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST clk_state=%d\n", res->status);
 			break;
 		default:
 			dev_err(afe->dev, "Unknown cmd 0x%x\n",	res->opcode);
@@ -1155,6 +1165,9 @@ static int q6afe_set_param(struct q6afe *afe, struct q6afe_port *port,
 	pdata->param_id = param_id;
 	pdata->param_size = psize;
 
+	//printk(KERN_INFO "%s DBG\n", __func__);
+	//print_hex_dump(KERN_INFO, "q6afe ", DUMP_PREFIX_NONE,
+	//	       16, 1, p, pkt_size, 0);
 	ret = afe_apr_send_pkt(afe, pkt, port, AFE_SVC_CMD_SET_PARAM);
 	if (ret)
 		dev_err(afe->dev, "AFE set params failed %d\n", ret);
@@ -1254,9 +1267,12 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 	cset.clk_root = clk_root;
 	cset.enable = !!freq;
 
-	return q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
+	printk(KERN_INFO "%s: clk_id=%d, attri=%d, clk_root=%d, freq=%d\n", __func__, clk_id, attri, clk_root, freq);
+	int ret = q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
 			       AFE_MODULE_CLOCK_SET, sizeof(cset),
 			       AFE_CLK_TOKEN);
+	//usleep_range(1000000, 1000500);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6afe_set_lpass_clock);
 
@@ -1568,7 +1584,9 @@ int q6afe_i2s_port_prepare(struct q6afe_port *port, struct q6afe_i2s_cfg *cfg)
 		break;
 	}
 
+	// FINDME this is pretty close to downstream msm_dai_q6_mi2s_get_lineconfig
 	num_sd_lines = hweight_long(cfg->sd_line_mask);
+	printk(KERN_ERR "%s:%d num_sd_lines=0x%x cfg->sd_line_mask=0x%x\n", __func__, __LINE__, num_sd_lines, cfg->sd_line_mask);
 
 	switch (num_sd_lines) {
 	case 0:
@@ -1677,6 +1695,7 @@ int q6afe_i2s_port_prepare(struct q6afe_port *port, struct q6afe_i2s_cfg *cfg)
 		break;
 	}
 
+	printk(KERN_ERR "%s:%d DBG num_sd_lines=0x%x mono_stereo=0x%x channel_mode=0x%x\n", __func__, __LINE__, num_sd_lines, pcfg->i2s_cfg.mono_stereo, pcfg->i2s_cfg.channel_mode);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(q6afe_i2s_port_prepare);
@@ -1902,6 +1921,12 @@ int q6afe_unvote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
 	int pkt_size = APR_HDR_SIZE + sizeof(*vote_cfg);
 
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+
+	if (client_handle <= 0) {
+		dev_err(afe->dev, "%s: invalid client handle\n", __func__);
+		return -EINVAL;
+	}
+
 	if (!p)
 		return -ENOMEM;
 
@@ -1914,15 +1939,21 @@ int q6afe_unvote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
 	pkt->hdr.pkt_size = pkt_size;
 	pkt->hdr.src_port = 0;
 	pkt->hdr.dest_port = 0;
-	pkt->hdr.token = hw_block_id;
+	pkt->hdr.token = hw_block_id; // 0
 	pkt->hdr.opcode = AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST;
 	vote_cfg->hw_block_id = hw_block_id;
 	vote_cfg->client_handle = client_handle;
+
+	//print_hex_dump(KERN_INFO, "q6afe ", DUMP_PREFIX_NONE,
+	//	       16, 1, pkt, pkt_size, 0);
+	//printk(KERN_ERR "%s: lpass core hw unvote opcode[0x%x] hw id[0x%x] client handle [0x%x]\n",
+	//	__func__, pkt->hdr.opcode, vote_cfg->hw_block_id, vote_cfg->client_handle);
 
 	ret = apr_send_pkt(afe->apr, pkt);
 	if (ret < 0)
 		dev_err(afe->dev, "AFE failed to unvote (%d)\n", hw_block_id);
 
+	//printk(KERN_ERR "%s: ret=%d\n", __func__, ret);
 	return ret;
 }
 EXPORT_SYMBOL(q6afe_unvote_lpass_core_hw);
@@ -1985,6 +2016,7 @@ static int q6afe_probe(struct apr_device *adev)
 
 	dev_set_drvdata(dev, afe);
 
+	printk(KERN_ERR "%s:%d DBG\n", __func__, __LINE__);
 	return devm_of_platform_populate(dev);
 }
 
