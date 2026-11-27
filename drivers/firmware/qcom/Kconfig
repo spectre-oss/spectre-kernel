@@ -79,4 +79,12 @@ config QCOM_QSEECOM_UEFISECAPP
 	  Select Y here to provide access to EFI variables on the aforementioned
 	  platforms.
 
+config SUNFISH_FPC_LAB
+	bool "Pixel 4a FPC secure capture lab"
+	depends on QCOM_QSEECOM && OF && GPIOLIB
+	select FW_LOADER
+	help
+	  Root-triggered signed FPC app loading and capture experiments.
+	  No calls are issued at boot. Enrollment and matching are not supported.
+
 endmenu

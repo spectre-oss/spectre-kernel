@@ -15,6 +15,7 @@
 #include <linux/export.h>
 #include <linux/firmware/qcom/qcom_pas.h>
 #include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/sunfish_fpc.h>
 #include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/init.h>
 #include <linux/interconnect.h>
@@ -2219,6 +2220,150 @@ int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send);
+
+#if IS_ENABLED(CONFIG_SUNFISH_FPC_LAB)
+/* Stock sunfish QSEE ABI. Only the lab's explicitly registered listeners
+ * support INCOMPLETE continuation; reentrant BLOCKED calls remain unsupported.
+ * On error, the lab client becomes unusable until reboot and retains its
+ * reserved buffers; secure-world callbacks must never reference freed RAM.
+ */
+static int (*fpc_listener_callback)(void *, u32);
+static void *fpc_listener_context;
+
+void qcom_scm_fpc_listener_set(int (*callback)(void *, u32), void *context)
+{
+	mutex_lock(&qcom_scm_qseecom_call_lock);
+	fpc_listener_callback = callback;
+	fpc_listener_context = context;
+	mutex_unlock(&qcom_scm_qseecom_call_lock);
+}
+
+static int qcom_scm_fpc_call(const struct qcom_scm_desc *desc, u32 *app_id)
+{
+	struct qcom_scm_qseecom_resp res = {};
+	int ret;
+	unsigned int callbacks = 0;
+
+	mutex_lock(&qcom_scm_qseecom_call_lock);
+	ret = __qcom_scm_qseecom_call(desc, &res);
+	while (!ret && res.result == QSEECOM_RESULT_INCOMPLETE) {
+		struct qcom_scm_desc reply = {
+			.owner = QSEECOM_TZ_OWNER_QSEE_OS, .svc = 2, .cmd = 3,
+			.arginfo = QCOM_SCM_ARGS(2),
+			.args = { res.data, 0 },
+		};
+
+		if (++callbacks > 256 || res.resp_type != QSEECOM_SCM_RES_QSEOS_LISTENER_ID ||
+		    res.data > U32_MAX || !fpc_listener_callback) {
+			ret = -EINPROGRESS;
+			break;
+		}
+		ret = fpc_listener_callback(fpc_listener_context, res.data);
+		if (ret)
+			break;
+		ret = __qcom_scm_qseecom_call(&reply, &res);
+	}
+	mutex_unlock(&qcom_scm_qseecom_call_lock);
+	dev_info(__scm->dev, "FPC SCM cmd=%u ret=%d result=%llu type=%llx data=%llx\n",
+		 desc->cmd, ret, res.result, res.resp_type, res.data);
+	if (ret)
+		return ret;
+	if (res.result == QSEECOM_RESULT_INCOMPLETE ||
+	    res.result == QSEECOM_RESULT_BLOCKED_ON_LISTENER)
+		return -EINPROGRESS;
+	if (res.result != QSEECOM_RESULT_SUCCESS)
+		return -EIO;
+	if (app_id) {
+		if (res.resp_type != QSEECOM_SCM_RES_APP_ID ||
+		    !res.data || res.data > U32_MAX)
+			return -EPROTO;
+		*app_id = res.data;
+	}
+	return 0;
+}
+
+int qcom_scm_fpc_listener_register(u32 id, phys_addr_t buffer, u32 size)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_QSEE_OS, .svc = 2, .cmd = 1,
+		.arginfo = QCOM_SCM_ARGS(3, QCOM_SCM_VAL, QCOM_SCM_RW, QCOM_SCM_VAL),
+		.args = { id, buffer, size },
+	};
+
+	if (id != 0xa && id != 0x7000 && id != 0x2000)
+		return -EINVAL;
+	return qcom_scm_fpc_call(&desc, NULL);
+}
+
+int qcom_scm_fpc_load(phys_addr_t image, u32 mdt_len, u32 image_len,
+		      u32 *app_id)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_QSEE_OS,
+		.svc = QSEECOM_TZ_SVC_APP_MGR,
+		.cmd = 1,
+		.arginfo = QCOM_SCM_ARGS(3),
+		.args = { mdt_len, image_len, image },
+	};
+
+	return qcom_scm_fpc_call(&desc, app_id);
+}
+
+int qcom_scm_fpc_send(u32 app_id, phys_addr_t request,
+		      phys_addr_t response, phys_addr_t whitelist)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_TZ_APPS,
+		.svc = QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER,
+		.cmd = 6,
+		.arginfo = QCOM_SCM_ARGS(7, QCOM_SCM_VAL, QCOM_SCM_RW,
+				QCOM_SCM_VAL, QCOM_SCM_RW, QCOM_SCM_VAL,
+				QCOM_SCM_RW, QCOM_SCM_VAL),
+		.args = { app_id, request, 64, response, 64, whitelist, 32 },
+	};
+
+	return qcom_scm_fpc_call(&desc, NULL);
+}
+
+int qcom_scm_fpc_key_request(u32 app_id, phys_addr_t request, phys_addr_t response, u32 req_size, u32 rsp_size)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_TZ_APPS,
+		.svc = QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER,
+		.cmd = QSEECOM_TZ_CMD_APP_SEND,
+		.arginfo = QCOM_SCM_ARGS(5, QCOM_SCM_VAL, QCOM_SCM_RW,
+			QCOM_SCM_VAL, QCOM_SCM_RW, QCOM_SCM_VAL),
+		.args = { app_id, request, req_size, response, rsp_size },
+	};
+	return qcom_scm_fpc_call(&desc, NULL);
+}
+
+int qcom_scm_fpc_log(phys_addr_t buffer, u32 size)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_QSEE_OS,
+		.svc = QSEECOM_TZ_SVC_APP_MGR,
+		.cmd = 6,
+		.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL),
+		.args = { buffer, size },
+	};
+
+	return qcom_scm_fpc_call(&desc, NULL);
+}
+
+int qcom_scm_fpc_unload(u32 app_id)
+{
+	const struct qcom_scm_desc desc = {
+		.owner = QSEECOM_TZ_OWNER_QSEE_OS,
+		.svc = QSEECOM_TZ_SVC_APP_MGR,
+		.cmd = 2,
+		.arginfo = QCOM_SCM_ARGS(1),
+		.args = { app_id },
+	};
+
+	return qcom_scm_fpc_call(&desc, NULL);
+}
+#endif
 
 /*
  * We do not yet support re-entrant calls via the qseecom interface. To prevent
